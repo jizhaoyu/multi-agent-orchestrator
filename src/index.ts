@@ -9,6 +9,9 @@ export * from './types';
 // 导出 Claude 集成
 export * from './integrations/claude';
 
+// 导出 Telegram 集成
+export * from './integrations/telegram';
+
 // 导出核心模块
 export { MemoryService } from './core/memory-service';
 export type { MemoryServiceConfig } from './core/memory-service';

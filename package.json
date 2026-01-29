@@ -1,6 +1,6 @@
 {
   "name": "multi-agent-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multi-Agent Orchestrator - 让 Claude Code 大哥指挥多个小弟协同完成任务",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,14 +10,17 @@
     "test": "vitest",
     "test:coverage": "vitest --coverage",
     "lint": "eslint src --ext .ts",
-    "format": "prettier --write \"src/**/*.ts\""
+    "format": "prettier --write \"src/**/*.ts\"",
+    "example:basic": "ts-node examples/basic-usage.ts",
+    "example:telegram": "ts-node examples/telegram-bot.ts"
   },
   "keywords": [
     "multi-agent",
     "orchestrator",
     "claude",
     "ai",
-    "automation"
+    "automation",
+    "telegram"
   ],
   "author": "",
   "license": "MIT",
