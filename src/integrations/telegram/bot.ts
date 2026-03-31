@@ -561,6 +561,11 @@ export class TelegramBotIntegration extends EventEmitter {
       const summary = await this.config.orchestrator.integrateResults(executableTasks);
       await this.sendOrchestratorSummaryMessages(chatId, summary);
     } catch (error) {
+      this.emit('execution-error', {
+        chatId,
+        taskId: task.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
       await this.sendMessage(chatId, {
         type: 'error_report',
         from: 'orchestrator',
@@ -743,10 +748,18 @@ export class TelegramBotIntegration extends EventEmitter {
     chatId: string,
     summary: unknown
   ): Promise<void> {
+    const formattedContent = this.formatSummary(summary);
+
     await this.sendMessage(chatId, {
       type: 'task_complete',
       from: 'orchestrator',
-      content: this.formatSummary(summary),
+      content: formattedContent,
+    });
+
+    this.emit('final-summary', {
+      chatId,
+      summary,
+      content: formattedContent,
     });
 
     if (!this.shouldEmitIntermediateExecutionUpdates()) {

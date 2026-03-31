@@ -36,6 +36,9 @@ export type { AIProvider } from './integrations/client-factory';
 // 导出 Telegram 集成
 export * from './integrations/telegram';
 
+// 导出 Feishu 集成
+export * from './integrations/feishu';
+
 // 导出 Harness 模块
 export * from './harness';
 

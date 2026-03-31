@@ -18,6 +18,7 @@
 - `Generator-Verifier-Reviser` 自动闭环
 - Trace 事件记录与失败知识沉淀
 - Telegram Bot 作为控制面
+- Feishu Bot 事件订阅接入（可与 Telegram 共存）
 - Starter 模板、runbook、benchmark 入口，便于未来项目复用
 
 ## 已实现功能
@@ -48,7 +49,13 @@
 - 已支持 `/task`、`/project`、`/projects`、`/pwd`、`/queue`、`/logs`、`/cancel`、`/status`、`/workers`、`/reset`、`/help`
 - 支持项目目录切换、搜索工作区、任务状态查看、日志查看、实时中断和长消息分段发送
 
-### 5. 未来项目复用
+### 5. Feishu 控制面
+
+- 已支持飞书事件订阅回调，接收文本消息并触发编排器执行
+- 当前提供 `/task`、`/cancel`、`/status`、`/workers`、`/help` 最小闭环
+- 默认走后台静默执行，仅回执与最终结论，保留 Telegram 原有配置和入口不变
+
+### 6. 未来项目复用
 
 - `templates/codex-harness/` 提供未来项目 starter
 - `scripts/init-codex-harness.mjs` 初始化 `AGENTS.md`、runbooks、failure catalog、benchmark
@@ -62,6 +69,13 @@
 - 默认切换为静默执行模式，收到任务后只回执和最终结论，不再连续刷出拆解、分配、单个小弟完整结果。
 - `/cancel` 会真实中断当前运行中的 Worker，而不是只改数据库状态。
 - 最终输出改为结构化结论块，优先展示 `📌 结论 / 📎 要点 / 💡 建议`，避免长段落和半截截断。
+
+### 1.1 Feishu 接入已补上独立入口
+
+- 新增 `FeishuBotIntegration`，通过事件订阅接收飞书文本消息，不影响 Telegram 现有配置。
+- 新增 `examples/feishu-bot.ts` 与 `npm run start:feishu`，可单独启动飞书控制面。
+- 飞书当前优先覆盖“发任务 + 静默执行 + 中断 + 状态查询”最小闭环，后续再扩展审批卡片。
+- 如果在 Telegram 模式下额外配置 `FEISHU_WEBHOOK_URL`，最终结论和重大异常也会同步推送到飞书。
 
 ### 2. 调度与容错逻辑更稳定
 
@@ -123,6 +137,16 @@ Copy-Item .env.example .env
 - 可选：`WORKSPACE_ROOT`
 - 可选：`PROJECT_SEARCH_ROOTS`
 
+如果要启用 Feishu 控制面，还需要：
+
+- `FEISHU_WEBHOOK_URL`，用于把消息推送到飞书自定义机器人
+- 如果要从飞书直接发消息控制任务，还需要 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`
+- 可选：`FEISHU_VERIFICATION_TOKEN`
+- 可选：`FEISHU_EVENT_HOST`
+- 可选：`FEISHU_EVENT_PORT`
+- 可选：`FEISHU_EVENT_PATH`
+- 可选：`FEISHU_CHAT_ID`
+
 示例配置见：[.env.example](./.env.example)
 
 ### 先跑一次完整验证
@@ -175,6 +199,19 @@ npm run start:telegram
 
 启动后会持续运行，直到 `Ctrl+C` 停止。
 
+### 3. Feishu 服务模式
+
+```bash
+npm run start:feishu
+```
+
+用途：
+
+- 通过飞书事件订阅 URL 接收文本消息
+- 在飞书群或会话里发起任务、取消任务、查询当前状态
+- 如果只配置 `FEISHU_WEBHOOK_URL`，可先用于结果推送；若要从飞书里直接下发任务，需要继续配置事件订阅能力
+- 与 Telegram 配置共存，按需独立启停
+
 ## 常用命令
 
 ```bash
@@ -186,6 +223,7 @@ npm run build
 npm run verify
 npm run start:basic
 npm run start:telegram
+npm run start:feishu
 npm run harness:init
 npm run harness:doctor
 npm run benchmarks

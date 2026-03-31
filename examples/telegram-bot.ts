@@ -9,6 +9,7 @@ import {
   StateManager,
   TaskManager,
   MemoryService,
+  FeishuBotIntegration,
   createAPIClientFromEnv,
 } from '../src';
 import { TelegramBotIntegration } from '../src/integrations/telegram';
@@ -102,6 +103,17 @@ async function main() {
     workers,
   });
 
+  const feishuNotifier = shouldEnableFeishuPush()
+    ? new FeishuBotIntegration({
+        appId: process.env.FEISHU_APP_ID,
+        appSecret: process.env.FEISHU_APP_SECRET,
+        webhookUrl: process.env.FEISHU_WEBHOOK_URL,
+        defaultChatId: process.env.FEISHU_CHAT_ID,
+        orchestrator,
+        workers,
+      })
+    : null;
+
   // 监听 Bot 事件
   telegramBot.on('started', () => {
     console.log('✅ Telegram Bot 已启动');
@@ -116,6 +128,26 @@ async function main() {
   telegramBot.on('message-to-agent', (event) => {
     console.log(`📤 消息发送给 ${event.agentId}: ${event.message}`);
   });
+
+  if (feishuNotifier) {
+    telegramBot.on('final-summary', async (event) => {
+      try {
+        await feishuNotifier.sendNotification(event.content);
+      } catch (error) {
+        console.error('Feishu summary push failed:', error);
+      }
+    });
+
+    telegramBot.on('execution-error', async (event) => {
+      try {
+        await feishuNotifier.sendNotification(
+          ['⚠️ 任务异常', '', `聊天: ${event.chatId}`, `任务: ${event.taskId}`, event.error].join('\n')
+        );
+      } catch (error) {
+        console.error('Feishu error push failed:', error);
+      }
+    });
+  }
 
   // 6. 启动系统
   console.log('▶️  启动系统...\n');
@@ -134,6 +166,9 @@ async function main() {
     await orchestrator.stop();
 
     await telegramBot.destroy();
+    if (feishuNotifier) {
+      await feishuNotifier.destroy();
+    }
     await orchestrator.destroy();
 
     for (const worker of workers) {
@@ -183,4 +218,16 @@ function readNumber(value: string | undefined): number | undefined {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function shouldEnableFeishuPush(): boolean {
+  if (process.env.FEISHU_WEBHOOK_URL) {
+    return true;
+  }
+
+  return Boolean(
+    process.env.FEISHU_APP_ID &&
+      process.env.FEISHU_APP_SECRET &&
+      process.env.FEISHU_CHAT_ID
+  );
 }

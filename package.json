@@ -17,11 +17,13 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "start:basic": "node scripts/run-with-proxy.mjs examples/basic-usage.ts",
     "start:telegram": "node scripts/run-with-proxy.mjs examples/telegram-bot.ts",
+    "start:feishu": "node scripts/run-with-proxy.mjs examples/feishu-bot.ts",
     "harness:init": "node scripts/init-codex-harness.mjs .",
     "harness:doctor": "node scripts/check-doc-drift.mjs .",
     "benchmarks": "node scripts/run-benchmarks.mjs benchmarks",
     "example:basic": "ts-node -r tsconfig-paths/register examples/basic-usage.ts",
-    "example:telegram": "ts-node -r tsconfig-paths/register examples/telegram-bot.ts"
+    "example:telegram": "ts-node -r tsconfig-paths/register examples/telegram-bot.ts",
+    "example:feishu": "ts-node -r tsconfig-paths/register examples/feishu-bot.ts"
   },
   "keywords": [
     "multi-agent",
