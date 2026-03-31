@@ -46,7 +46,7 @@
 ### 4. Telegram 控制面
 
 - 已支持 `/task`、`/project`、`/projects`、`/pwd`、`/queue`、`/logs`、`/cancel`、`/status`、`/workers`、`/reset`、`/help`
-- 支持项目目录切换、搜索工作区、任务状态查看、日志查看、软取消和长消息分段发送
+- 支持项目目录切换、搜索工作区、任务状态查看、日志查看、实时中断和长消息分段发送
 
 ### 5. 未来项目复用
 
@@ -54,6 +54,30 @@
 - `scripts/init-codex-harness.mjs` 初始化 `AGENTS.md`、runbooks、failure catalog、benchmark
 - `scripts/check-doc-drift.mjs` 检查 Harness 文档是否漂移
 - `scripts/run-benchmarks.mjs` 汇总 benchmark 结果
+
+## 近期更新
+
+### 1. Telegram 交互更适合后台静默执行
+
+- 默认切换为静默执行模式，收到任务后只回执和最终结论，不再连续刷出拆解、分配、单个小弟完整结果。
+- `/cancel` 会真实中断当前运行中的 Worker，而不是只改数据库状态。
+- 最终输出改为结构化结论块，优先展示 `📌 结论 / 📎 要点 / 💡 建议`，避免长段落和半截截断。
+
+### 2. 调度与容错逻辑更稳定
+
+- `TaskManager.getNextTask()` 现在会跳过被父任务阻塞的 pending 任务，继续返回真正可执行的任务。
+- `Orchestrator.handleError()` 重新分配失败任务时，会真正驱动目标 Worker 执行，而不只是写回任务状态。
+- `StateManager` 查询已回填真实 `agent_stats`，空闲 Worker 选择和状态展示不再依赖伪统计值。
+
+### 3. 运行时开销进一步收敛
+
+- 指令上下文拼装已提取为独立缓存组件，减少重复读取 `AGENTS.md`、runbook 和配置文件造成的 I/O 开销。
+- 高频 SQLite 查询已复用 prepared statements，并补上批量任务写入与公共 schema loader，减少重复 prepare 和重复 schema 读取。
+
+### 4. 工程治理补齐
+
+- 新增 GitHub Actions CI，默认执行 `npm ci`、`lint`、`typecheck`、`test`、`build`。
+- 补充 `npm run audit:high` 作为依赖安全扫描入口，当前以可见告警为主，便于后续替换 Telegram 依赖链中的旧组件。
 
 ## 快速开始
 
@@ -66,6 +90,12 @@
 
 ```bash
 npm install
+```
+
+CI 和可复现环境建议统一使用：
+
+```bash
+npm ci
 ```
 
 ### 配置环境变量
@@ -108,14 +138,23 @@ npm run verify
 - `npm test`
 - `npm run build`
 
+仓库已补充 GitHub Actions 持续集成，默认会执行：
+
+- `npm ci`
+- `npm run lint`
+- `npm run typecheck`
+- `npm test`
+- `npm run build`
+- `npm run audit:high`（安全扫描单独展示，当前以可见告警为主，不阻塞主质量门）
+
 ## 启动方式
 
-当前仓库还没有统一的 `npm start`，现在有两个正式入口。
+当前仓库已经提供两个统一启动入口，会自动复用 `.env` 中的代理配置。
 
 ### 1. 本地基础运行
 
 ```bash
-npm run example:basic
+npm run start:basic
 ```
 
 用途：
@@ -126,7 +165,7 @@ npm run example:basic
 ### 2. Telegram 服务模式
 
 ```bash
-npm run example:telegram
+npm run start:telegram
 ```
 
 用途：
@@ -141,14 +180,15 @@ npm run example:telegram
 ```bash
 npm run lint
 npm run typecheck
+npm run audit:high
 npm test
 npm run build
 npm run verify
+npm run start:basic
+npm run start:telegram
 npm run harness:init
 npm run harness:doctor
 npm run benchmarks
-npm run example:basic
-npm run example:telegram
 ```
 
 ## 目录结构
@@ -196,7 +236,14 @@ tests/                   单元与集成测试
 - 版本：`0.2.0`
 - 状态：多 Agent 编排 + Codex Harness 基线已接通
 - 验证链路：`lint / typecheck / test / build`
-- 示例入口：`example:basic`、`example:telegram`
+- 示例入口：`start:basic`、`start:telegram`
+
+## 工程治理说明
+
+- 数据层已统一复用 schema loader，并为高频 SQLite 查询复用 prepared statements，减少重复 prepare 和 N+1 查询。
+- `Worker` 已把指令上下文拼装提取为独立缓存组件，避免每个任务重复读取和拼接同一批说明文件。
+- GitHub Actions 已接入 lockfile 驱动的 `npm ci` 流程，主质量门覆盖 lint、typecheck、test、build。
+- `npm audit` 当前会暴露 `node-telegram-bot-api` 依赖链上的历史漏洞，CI 已单独透出该结果，便于后续替换依赖或升级接入层。
 
 ## License
 

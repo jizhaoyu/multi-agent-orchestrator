@@ -124,12 +124,14 @@ class MockOrchestrator extends EventEmitter {
     rootTaskFound: true,
     cancelledPendingCount: 0,
     runningCount: 0,
+    interruptedRunningCount: 0,
   }));
 }
 
 class MockWorker extends EventEmitter {
   status: 'idle' | 'busy' | 'error' = 'idle';
   currentTaskId: string | null = null;
+  cancelCurrentTask = vi.fn(async () => true);
 
   constructor(public readonly id: string) {
     super();
@@ -266,6 +268,171 @@ describe('TelegramBotIntegration', () => {
     await integration.destroy();
   });
 
+  it('should reply directly to greeting without creating orchestration task', async () => {
+    const { integration, orchestrator } = createIntegration();
+    const bot = telegramMockState.instances[0];
+
+    bot?.emit('message', createTelegramMessage('你好'));
+    await waitFor(() => (bot?.sendMessageCalls.length || 0) > 0);
+
+    expect(orchestrator.receiveTask).not.toHaveBeenCalled();
+    expect(bot?.sendMessageCalls).toHaveLength(1);
+    expect(bot?.sendMessageCalls[0]?.text).toContain('你好，我在');
+    expect(bot?.sendMessageCalls[0]?.text).not.toContain('任务已接收');
+
+    await integration.destroy();
+  });
+
+  it('should reply directly to thanks without creating orchestration task', async () => {
+    const { integration, orchestrator } = createIntegration();
+    const bot = telegramMockState.instances[0];
+
+    bot?.emit('message', createTelegramMessage('谢谢'));
+    await waitFor(() => (bot?.sendMessageCalls.length || 0) > 0);
+
+    expect(orchestrator.receiveTask).not.toHaveBeenCalled();
+    expect(bot?.sendMessageCalls).toHaveLength(1);
+    expect(bot?.sendMessageCalls[0]?.text).toContain('不客气');
+
+    await integration.destroy();
+  });
+
+  it('should classify ECONNRESET polling errors as retryable network interruptions', async () => {
+    const { integration } = createIntegration();
+
+    const hint = (integration as unknown as {
+      getPollingErrorHint: (details: { code?: string; message: string; cause?: string }) => string | undefined;
+    }).getPollingErrorHint({
+      code: 'EFATAL',
+      message: 'EFATAL: Error: read ECONNRESET',
+      cause: 'Error: read ECONNRESET',
+    });
+
+    expect(hint).toContain('TELEGRAM_PROXY_URL');
+
+    await integration.destroy();
+  });
+
+  it('should treat UND_ERR_SOCKET shutdowns as retryable Telegram network errors', async () => {
+    const { integration } = createIntegration();
+
+    const retryable = (integration as unknown as {
+      isRetryableTelegramNetworkError: (error: unknown) => boolean;
+    }).isRetryableTelegramNetworkError(new Error('UND_ERR_SOCKET other side closed'));
+
+    expect(retryable).toBe(true);
+
+    await integration.destroy();
+  });
+
+  it('should auto-format long plain text results into readable paragraphs', async () => {
+    const { integration } = createIntegration();
+    const longNovelText =
+      '恋爱小说' +
+      '\n' +
+      '林夏第一次在旧书店见到周屿时，窗外正下着很细的雨，她原本只是想买一本绝版诗集，却在书架转角看见他蹲在地上修一盏快要熄灭的小灯。她没有说话，只是站在那里看了几秒，周屿抬头时正好对上她的目光，像是早就认识一样笑了笑。后来他们因为同一本书聊了很久，从诗句聊到大学，从城市夜路聊到各自不愿告诉别人的心事，连老板什么时候打烊都没有察觉。第二天林夏再去时，周屿已经把那本诗集包好放在柜台旁边，还在封面里夹了一张手写便签，说雨停之前，故事可以先从这里开始。再后来他们一起走过很多条街，一起在地铁末班车前奔跑，也一起在误会里沉默过很久，可每次快要错过的时候，总有人愿意先转身，像那晚旧书店里亮起来的小灯一样，把彼此重新照见。';
+
+    const detail = (integration as unknown as {
+      extractTaskResultDetail: (result: unknown) => { summary: string } | null;
+    }).extractTaskResultDetail(longNovelText);
+
+    expect(detail?.summary).toContain('恋爱小说\n\n');
+    expect(detail?.summary).toContain('旧书店见到周屿时');
+    expect(detail?.summary).toContain('\n\n');
+    expect(detail?.summary?.split('\n\n').length).toBeGreaterThanOrEqual(3);
+
+    await integration.destroy();
+  });
+
+  it('should preserve structured markdown results when auto-formatting', async () => {
+    const { integration } = createIntegration();
+    const markdownResult = [
+      '项目整体可概括为多 Agent 编排层、开发 Harness 可靠性层、Telegram 控制面三部分。',
+      '',
+      '1. 整体架构',
+      '- 入口层：统一导出入口。',
+      '- 核心编排层：负责任务拆解与调度。',
+      '',
+      '2. 功能边界',
+      '- 项目不是业务系统，而是 AI 执行编排框架。',
+    ].join('\n');
+
+    const detail = (integration as unknown as {
+      extractTaskResultDetail: (result: unknown) => { summary: string } | null;
+    }).extractTaskResultDetail(markdownResult);
+
+    expect(detail?.summary).toContain('📌 项目整体可概括为多 Agent 编排层');
+    expect(detail?.summary).toContain('🏗️ 1. 整体架构');
+    expect(detail?.summary).toContain('⚙️ 2. 功能边界');
+    expect(detail?.summary).toContain('• 入口层：统一导出入口。');
+    expect(detail?.summary).toContain('• 核心编排层：负责任务拆解与调度。');
+
+    await integration.destroy();
+  });
+
+  it('should keep background execution quiet in silent mode and only send receipt plus final summary', async () => {
+    const workspaceRoot = 'D:/workspace/demo';
+    const { integration, orchestrator, worker } = createIntegration({
+      defaultWorkspaceRoot: workspaceRoot,
+      executionUpdatesMode: 'silent',
+    });
+    const bot = telegramMockState.instances[0];
+
+    orchestrator.decomposeTask = vi.fn(async () => []);
+    orchestrator.assignTasks = vi.fn(async (tasks) => {
+      const task = tasks[0];
+      if (!task) {
+        return;
+      }
+
+      worker.emit('progress', {
+        taskId: task.id,
+        progress: 42,
+        message: '正在静默处理中',
+        chatId: '1001',
+      });
+      worker.emit('task-completed', {
+        ...task,
+        context: {
+          ...task.context,
+          workspaceRoot,
+        },
+        result: '最终意见：建议先修复任务调度，再处理展示层优化。',
+      });
+    });
+    orchestrator.integrateResults = vi.fn(async () => ({
+      totalTasks: 1,
+      completedTasks: 1,
+      failedTasks: 0,
+      results: [
+        {
+          taskId: 'task-1',
+          description: '输出最终意见',
+          result: '最终意见：建议先修复任务调度，再处理展示层优化。',
+        },
+      ],
+      failures: [],
+    }));
+
+    bot?.emit('message', createTelegramMessage('/task 输出最终意见'));
+    await waitFor(() => orchestrator.integrateResults.mock.calls.length > 0, 500);
+
+    const texts = bot?.sendMessageCalls.map((call) => call.text) || [];
+
+    expect(texts.some((text) => text.includes('任务已接收'))).toBe(true);
+    expect(texts.some((text) => text.includes('后台静默运行'))).toBe(true);
+    expect(texts.some((text) => text.includes('🎯 最终结论'))).toBe(true);
+    expect(texts.some((text) => text.includes('📌 结论'))).toBe(true);
+    expect(texts.some((text) => text.includes('建议先修复任务调度'))).toBe(true);
+    expect(texts.some((text) => text.includes('分析中'))).toBe(false);
+    expect(texts.some((text) => text.includes('分配中'))).toBe(false);
+    expect(texts.some((text) => text.includes('正在静默处理中'))).toBe(false);
+    expect(texts.some((text) => text.includes('✅ 任务完成'))).toBe(false);
+    expect(texts.some((text) => text.includes('任务 1 完整结果'))).toBe(false);
+
+    await integration.destroy();
+  });
+
   it('should support /task command and send workflow stage updates', async () => {
     const workspaceRoot = 'D:/workspace/demo';
     const { integration, orchestrator } = createIntegration({
@@ -330,7 +497,53 @@ describe('TelegramBotIntegration', () => {
     expect(texts.some((text) => text.includes('分配中'))).toBe(true);
     expect(texts.some((text) => text.includes('任务难度: 复杂'))).toBe(true);
     expect(texts.some((text) => text.includes('调度小弟: 1 名'))).toBe(true);
-    expect(texts.some((text) => text.includes('任务流程已结束'))).toBe(true);
+    expect(texts.some((text) => text.includes('🎯 最终结论'))).toBe(true);
+
+    await integration.destroy();
+  });
+
+  it('should include failed tasks in final summary and send expanded failure details', async () => {
+    const { integration, orchestrator } = createIntegration();
+    const bot = telegramMockState.instances[0];
+    const longFailureSummary = '验证阶段发现自定义检查不通过，需要人工介入。'.repeat(30);
+
+    orchestrator.integrateResults = vi.fn(async () => ({
+      totalTasks: 2,
+      completedTasks: 1,
+      failedTasks: 1,
+      results: [
+        {
+          taskId: 'task-1',
+          description: '完成接口改造',
+          result: '接口已完成改造',
+        },
+      ],
+      failures: [
+        {
+          taskId: 'task-2',
+          description: '执行验证脚本',
+          error: '验证失败: Custom check 1',
+          result: {
+            mode: 'workspace',
+            summary: longFailureSummary,
+            changedFiles: ['report.md'],
+            verification: ['node -e "verify"'],
+          },
+        },
+      ],
+    }));
+
+    bot?.emit('message', createTelegramMessage('执行接口改造并验证'));
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    const texts = bot?.sendMessageCalls.map((call) => call.text) || [];
+
+    expect(texts.some((text) => text.includes('🎯 最终结论'))).toBe(true);
+    expect(texts.some((text) => text.includes('⚠️ 风险'))).toBe(true);
+    expect(texts.some((text) => text.includes('验证失败: Custom check 1'))).toBe(true);
+    expect(texts.some((text) => text.includes('⚠️ 失败任务 1 详情'))).toBe(true);
+    expect(texts.some((text) => text.includes(longFailureSummary.slice(0, 20)))).toBe(true);
 
     await integration.destroy();
   });
@@ -363,10 +576,10 @@ describe('TelegramBotIntegration', () => {
     await flushAsyncWork();
 
     expect(bot?.sendMessageCalls).toHaveLength(1);
-    expect(bot?.sendMessageCalls[0]?.text).toContain('任务完成');
-    expect(bot?.sendMessageCalls[0]?.text).toContain('关键结果');
-    expect(bot?.sendMessageCalls[0]?.text).toContain('修改文件');
-    expect(bot?.sendMessageCalls[0]?.text).toContain('验证');
+    expect(bot?.sendMessageCalls[0]?.text).toContain('✅ 任务完成');
+    expect(bot?.sendMessageCalls[0]?.text).toContain('✨ 关键结果');
+    expect(bot?.sendMessageCalls[0]?.text).toContain('🛠️ 修改文件');
+    expect(bot?.sendMessageCalls[0]?.text).toContain('✅ 验证');
 
     await integration.destroy();
   });
@@ -402,6 +615,81 @@ describe('TelegramBotIntegration', () => {
     await integration.destroy();
   });
 
+  it('should attach Telegram updates for dynamically created workers', async () => {
+    const { integration, orchestrator } = createIntegration({
+      chatId: '1001',
+    });
+    const bot = telegramMockState.instances[0];
+    const worker = new MockWorker('worker-2');
+
+    orchestrator.emit('worker-created', worker);
+    worker.emit('progress', {
+      taskId: 'task-2',
+      progress: 35,
+      message: '正在执行增量任务',
+    });
+    worker.emit('task-cancelled', {
+      id: 'task-2',
+      description: '执行增量任务',
+      context: {},
+      result: null,
+    }, new Error('任务已被 Telegram 用户取消'));
+    await flushAsyncWork();
+
+    expect(bot?.sendMessageCalls.some((call) => call.text.includes('worker-2'))).toBe(true);
+    expect(bot?.sendMessageCalls.some((call) => call.text.includes('任务已中断'))).toBe(true);
+
+    await integration.destroy();
+  });
+
+  it('should route task updates by task chat instead of the first connected chat', async () => {
+    const { integration, orchestrator, worker } = createIntegration();
+    const bot = telegramMockState.instances[0];
+
+    bot?.emit('message', createTelegramMessage('/help', 1001));
+    await flushAsyncWork();
+
+    orchestrator.emit(
+      'task-assigned',
+      {
+        id: 'task-chat-2',
+        description: '给第二个聊天执行的任务',
+        context: {
+          chatId: '2002',
+        },
+      },
+      worker
+    );
+
+    worker.emit('progress', {
+      taskId: 'task-chat-2',
+      progress: 30,
+      message: '正在处理第二个聊天',
+      chatId: '2002',
+    });
+
+    worker.emit('task-completed', {
+      id: 'task-chat-2',
+      description: '给第二个聊天执行的任务',
+      context: {
+        chatId: '2002',
+        workspaceRoot: 'D:/workspace/chat-2',
+      },
+      result: '第二个聊天的结果',
+    });
+    await flushAsyncWork();
+
+    const secondChatMessages =
+      bot?.sendMessageCalls.filter((call) => call.chatId === '2002').map((call) => call.text) || [];
+
+    expect(secondChatMessages.some((text) => text.includes('已分配给 worker-1'))).toBe(true);
+    expect(secondChatMessages.some((text) => text.includes('正在处理第二个聊天'))).toBe(true);
+    expect(secondChatMessages.some((text) => text.includes('第二个聊天的结果'))).toBe(true);
+    expect(bot?.sendMessageCalls.at(-1)?.chatId).toBe('2002');
+
+    await integration.destroy();
+  });
+
   it('should send full worker result in follow-up message when result is long', async () => {
     const { integration, worker } = createIntegration({
       chatId: '1001',
@@ -425,8 +713,8 @@ describe('TelegramBotIntegration', () => {
     await flushAsyncWork();
 
     expect(bot?.sendMessageCalls.length).toBeGreaterThanOrEqual(2);
-    expect(bot?.sendMessageCalls[0]?.text).toContain('任务完成');
-    expect(bot?.sendMessageCalls[1]?.text).toContain('完整结果');
+    expect(bot?.sendMessageCalls[0]?.text).toContain('✅ 任务完成');
+    expect(bot?.sendMessageCalls[1]?.text).toContain('📖 完整结果');
     expect(bot?.sendMessageCalls[1]?.text).toContain(longSummary.slice(0, 20));
 
     await integration.destroy();
@@ -501,7 +789,7 @@ describe('TelegramBotIntegration', () => {
     await integration.destroy();
   });
 
-  it('should soft-cancel current chat task', async () => {
+  it('should interrupt current chat task', async () => {
     const workspaceRoot = 'D:/workspace/demo';
     const { integration, orchestrator } = createIntegration({
       defaultWorkspaceRoot: workspaceRoot,
@@ -530,7 +818,8 @@ describe('TelegramBotIntegration', () => {
     );
 
     const texts = bot?.sendMessageCalls.map((call) => call.text) || [];
-    expect(texts.some((text) => text.includes('已收到取消请求'))).toBe(true);
+    expect(texts.some((text) => text.includes('已收到中断请求'))).toBe(true);
+    expect(texts.some((text) => text.includes('已发送中断信号'))).toBe(true);
     expect(texts.some((text) => text.includes('已停止继续调度'))).toBe(true);
     expect(orchestrator.cancelTaskTree).toHaveBeenCalledTimes(2);
 
@@ -657,8 +946,8 @@ describe('TelegramBotIntegration', () => {
     await flushAsyncWork();
     await flushAsyncWork();
 
-    expect(bot?.sendMessageCalls.some((call) => call.text.includes('任务流程已结束'))).toBe(true);
-    expect(bot?.sendMessageCalls.some((call) => call.text.includes('任务 1 完整结果'))).toBe(true);
+    expect(bot?.sendMessageCalls.some((call) => call.text.includes('🎯 最终结论'))).toBe(true);
+    expect(bot?.sendMessageCalls.some((call) => call.text.includes('📖 任务 1 完整结果'))).toBe(true);
     expect(bot?.sendMessageCalls.some((call) => call.text.includes(longSummary.slice(0, 20)))).toBe(true);
 
     await integration.destroy();
@@ -678,6 +967,7 @@ function createIntegration(
     token: 'test-token',
     orchestrator: orchestrator as unknown as Orchestrator,
     workers: [worker as unknown as Worker],
+    executionUpdatesMode: 'verbose',
     ...overrides,
   });
 
@@ -688,14 +978,14 @@ function createIntegration(
   };
 }
 
-function createTelegramMessage(text: string): {
+function createTelegramMessage(text: string, chatId = 1001): {
   chat: { id: number };
   text: string;
   from: { id: number; first_name: string };
   date: number;
 } {
   return {
-    chat: { id: 1001 },
+    chat: { id: chatId },
     text,
     from: {
       id: 2002,

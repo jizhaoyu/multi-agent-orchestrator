@@ -49,6 +49,12 @@ describe('StateManager', () => {
     expect(retrieved?.id).toBe('agent-1');
     expect(retrieved?.type).toBe('worker');
     expect(retrieved?.status).toBe('idle');
+    expect(retrieved?.stats).toMatchObject({
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      totalTokens: 0,
+      avgCompletionTime: 0,
+    });
   });
 
   it('should update agent status', async () => {
@@ -179,6 +185,51 @@ describe('StateManager', () => {
     const idleWorkers = await manager.getIdleWorkers();
     expect(idleWorkers).toHaveLength(1);
     expect(idleWorkers[0]?.id).toBe('worker-1');
+    expect(idleWorkers[0]?.stats).toMatchObject({
+      tasksCompleted: 0,
+      tasksFailed: 0,
+      totalTokens: 0,
+      avgCompletionTime: 0,
+    });
+  });
+
+  it('should hydrate stats when fetching agents', async () => {
+    const agent: IAgent = {
+      id: 'agent-with-stats',
+      type: 'worker',
+      status: 'idle',
+      currentTaskId: null,
+      lastHeartbeat: new Date(),
+      stats: {
+        tasksCompleted: 3,
+        tasksFailed: 1,
+        totalTokens: 321,
+        avgCompletionTime: 4567,
+      },
+    };
+
+    await manager.registerAgent(agent);
+
+    await expect(manager.getAgent(agent.id)).resolves.toMatchObject({
+      id: 'agent-with-stats',
+      stats: {
+        tasksCompleted: 3,
+        tasksFailed: 1,
+        totalTokens: 321,
+        avgCompletionTime: 4567,
+      },
+    });
+    await expect(manager.getAllAgents()).resolves.toContainEqual(
+      expect.objectContaining({
+        id: 'agent-with-stats',
+        stats: expect.objectContaining({
+          tasksCompleted: 3,
+          tasksFailed: 1,
+          totalTokens: 321,
+          avgCompletionTime: 4567,
+        }),
+      })
+    );
   });
 
   it('should get agent stats', async () => {

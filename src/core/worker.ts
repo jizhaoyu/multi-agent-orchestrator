@@ -27,6 +27,8 @@ import {
   type WorkspaceExecutionResult,
   type WorkspaceExecutionProgressEvent,
 } from './workspace-executor';
+import { isTaskCancelledError, toTaskCancelledError } from './task-cancelled-error';
+import { WorkerInstructionContext } from './worker-instruction-context';
 
 /**
  * Worker 配置
@@ -91,6 +93,17 @@ export interface WorkerProgressEvent {
   taskId: string;
   progress: number; // 0-100
   message: string;
+  chatId?: string;
+}
+
+class WorkspaceExecutionFailedError extends Error {
+  constructor(
+    message: string,
+    public readonly result: WorkspaceExecutionResult
+  ) {
+    super(message);
+    this.name = 'WorkspaceExecutionFailedError';
+  }
 }
 
 /**
@@ -112,6 +125,10 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
   private readonly workspaceExecutors = new Map<string, WorkspaceExecutor>();
+  private currentExecutionController: AbortController | null = null;
+  private readonly instructionContext: WorkerInstructionContext;
+  private readonly registrationPromise: Promise<void>;
+  private registrationError: Error | null = null;
 
   // IAgent 接口实现
   id: string;
@@ -158,14 +175,27 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
       avgCompletionTime: 0,
     };
 
-    // 注册到状态管理器
-    this.register();
+    this.instructionContext = new WorkerInstructionContext({
+      memoryService: this.config.memoryService,
+      instructionFiles: this.config.instructionFiles,
+      maxInstructionContextChars: this.config.maxInstructionContextChars,
+    });
+    this.registrationPromise = this.register().catch((error: unknown) => {
+      const registrationError =
+        error instanceof Error ? error : new Error(String(error));
+      this.registrationError = registrationError;
+      queueMicrotask(() => {
+        this.emit('registration-error', registrationError);
+      });
+    });
   }
 
   /**
    * 接收任务
    */
   async receiveTask(task: ITask): Promise<void> {
+    await this.ensureRegistered();
+
     this.currentTask = task;
     this.currentTaskId = task.id;
     this.status = 'busy';
@@ -183,22 +213,32 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
    * 执行任务
    */
   async executeTask(task: ITask): Promise<unknown> {
-    if (!this.isRunning) {
-      this.isRunning = true;
+    await this.ensureRegistered();
+
+    if (this.isRunning && this.currentTaskId !== task.id) {
+      throw new Error(`Worker ${this.id} is already executing another task`);
     }
+    this.isRunning = true;
 
     const startTime = Date.now();
+    const executionController = new AbortController();
+    this.currentExecutionController = executionController;
 
     try {
       const workspaceExecutor = this.getWorkspaceExecutor(task);
       const execution =
         workspaceExecutor
           ? {
-              result: await workspaceExecutor.executeTask(task),
+              result: await workspaceExecutor.executeTask(task, executionController.signal),
               tokenUsage: 0,
             }
-          : await this.executeTextTask(task);
+          : await this.executeTextTask(task, executionController.signal);
       const result = execution.result;
+
+      if (this.isFailedWorkspaceExecutionResult(result)) {
+        task.result = result;
+        throw new WorkspaceExecutionFailedError(result.summary, result);
+      }
 
       task.result = result;
       task.status = 'completed';
@@ -229,25 +269,53 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
         taskId: task.id,
         progress: 100,
         message: '任务完成',
+        chatId: this.getTaskChatId(task),
       } as WorkerProgressEvent);
 
       return result;
     } catch (error) {
+      if (isTaskCancelledError(error)) {
+        const cancelledError = toTaskCancelledError(error);
+        task.error = cancelledError.message;
+        task.status = 'failed';
+
+        await this.config.taskManager.updateTaskStatus(
+          task.id,
+          'failed',
+          null,
+          cancelledError.message
+        );
+        await this.config.stateManager.updateStats(this.id, this.stats);
+
+        this.emit('task-cancelled', task, cancelledError);
+        this.emit('progress', {
+          taskId: task.id,
+          progress: 100,
+          message: '任务已中断',
+          chatId: this.getTaskChatId(task),
+        } as WorkerProgressEvent);
+        throw cancelledError;
+      }
+
+      const taskError = error instanceof Error ? error : new Error(String(error));
+      const failedWorkspaceResult =
+        error instanceof WorkspaceExecutionFailedError ? error.result : undefined;
       this.stats.tasksFailed++;
-      task.error = error instanceof Error ? error.message : String(error);
+      task.result = failedWorkspaceResult || null;
+      task.error = taskError.message;
       task.status = 'failed';
 
       await this.config.taskManager.updateTaskStatus(
         task.id,
         'failed',
-        null,
-        error instanceof Error ? error.message : String(error)
+        failedWorkspaceResult,
+        taskError.message
       );
 
       await this.config.stateManager.updateStats(this.id, this.stats);
 
-      this.emit('task-failed', task, error);
-      throw error;
+      this.emit('task-failed', task, taskError);
+      throw taskError;
     } finally {
       // 停止心跳
       this.stopHeartbeat();
@@ -256,15 +324,29 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
       this.currentTask = null;
       this.currentTaskId = null;
       this.status = 'idle';
+      this.isRunning = false;
+      if (this.currentExecutionController === executionController) {
+        this.currentExecutionController = null;
+      }
 
       await this.config.stateManager.updateStatus(this.id, 'idle', null);
     }
+  }
+
+  async cancelCurrentTask(reason = '任务已被取消'): Promise<boolean> {
+    if (!this.currentExecutionController || this.currentExecutionController.signal.aborted) {
+      return false;
+    }
+
+    this.currentExecutionController.abort(toTaskCancelledError(reason));
+    return true;
   }
 
   /**
    * 发送心跳
    */
   async sendHeartbeat(): Promise<void> {
+    await this.ensureRegistered();
     this.lastHeartbeat = new Date();
     await this.config.stateManager.updateHeartbeat(this.id);
 
@@ -283,6 +365,7 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
       taskId: this.currentTask.id,
       progress: Math.max(0, Math.min(100, progress)),
       message,
+      chatId: this.getTaskChatId(this.currentTask),
     } as WorkerProgressEvent);
   }
 
@@ -301,10 +384,18 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
    * 分配子任务
    */
   async delegateSubtask(subtask: ITask): Promise<void> {
-    // 检查任务深度
-    if (subtask.depth >= 3) {
-      throw new Error(`任务深度超过限制: ${subtask.depth} >= 3`);
+    await this.ensureRegistered();
+
+    const maxDepth = this.config.taskManager.getMaxDepth();
+    if (subtask.depth > maxDepth) {
+      throw new Error(`任务深度超过限制: ${subtask.depth} > ${maxDepth}`);
     }
+
+    const existingTask = await this.config.taskManager.getTask(subtask.id);
+    if (!existingTask) {
+      await this.config.taskManager.addTask(subtask);
+    }
+    const taskToAssign = existingTask || subtask;
 
     // 获取空闲 Worker
     const idleWorkers = await this.config.stateManager.getIdleWorkers();
@@ -325,12 +416,12 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
     }
 
     // 分配任务
-    await this.config.taskManager.assignTask(subtask.id, targetWorker.id);
+    await this.config.taskManager.assignTask(taskToAssign.id, targetWorker.id);
 
     this.emit('subtask-delegated', {
       from: this.id,
       to: targetWorker.id,
-      task: subtask,
+      task: taskToAssign,
     });
   }
 
@@ -340,17 +431,8 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
   private startHeartbeat(): void {
     this.stopHeartbeat();
 
-    this.heartbeatTimer = setInterval(async () => {
-      await this.sendHeartbeat();
-
-      // 如果有当前任务，报告进度
-      if (this.currentTask) {
-        this.emit('progress', {
-          taskId: this.currentTask.id,
-          progress: -1, // -1 表示心跳，不更新进度
-          message: '心跳',
-        } as WorkerProgressEvent);
-      }
+    this.heartbeatTimer = setInterval(() => {
+      void this.runHeartbeatTick();
     }, this.config.heartbeatInterval);
   }
 
@@ -393,7 +475,7 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
 
     // 添加配置信息（从记忆服务读取）
     try {
-      const instructionContext = await this.readInstructionContext();
+      const instructionContext = await this.instructionContext.read();
       if (instructionContext) {
         message += `\n${instructionContext}\n`;
       }
@@ -413,10 +495,11 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
    */
   async destroy(): Promise<void> {
     this.stopHeartbeat();
+    this.instructionContext.destroy();
     this.removeAllListeners();
   }
 
-  private async executeTextTask(task: ITask): Promise<{
+  private async executeTextTask(task: ITask, signal: AbortSignal): Promise<{
     result: string;
     tokenUsage: number;
   }> {
@@ -424,9 +507,12 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
     const context = await this.buildContext(task);
 
     // 调用 AI API
-    const response = await this.config.apiClient.sendMessage(context.messages, {
-      system: context.system,
-    });
+    const response = await this.withCancellation(
+      this.config.apiClient.sendMessage(context.messages, {
+        system: context.system,
+      }),
+      signal
+    );
 
     return {
       result: response.content,
@@ -483,39 +569,80 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
     return this.config.workspaceRoot || null;
   }
 
-  private async readInstructionContext(): Promise<string | null> {
-    const sections: string[] = [];
-    let totalChars = 0;
+  private getTaskChatId(task: ITask | null): string | undefined {
+    if (!task) {
+      return undefined;
+    }
 
-    for (const relativePath of this.config.instructionFiles) {
-      try {
-        const data = await this.config.memoryService.read(relativePath);
-        const content =
-          typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-        const remaining = this.config.maxInstructionContextChars - totalChars;
-        if (remaining <= 0) {
-          break;
-        }
+    const contextChatId = task.context.chatId;
+    if (typeof contextChatId !== 'string' || contextChatId.trim().length === 0) {
+      return undefined;
+    }
 
-        const clipped = content.length > remaining ? `${content.slice(0, remaining)}\n...[truncated]` : content;
-        sections.push(`--- ${relativePath} ---\n${clipped}\n---`);
-        totalChars += clipped.length;
-      } catch (error) {
-        if (
-          error instanceof Error &&
-          error.message.startsWith('Memory file not found:')
-        ) {
-          continue;
-        }
-        throw error;
+    return contextChatId.trim();
+  }
+
+  private isFailedWorkspaceExecutionResult(
+    result: unknown
+  ): result is WorkspaceExecutionResult & { verdict: 'failed' } {
+    if (typeof result !== 'object' || result === null) {
+      return false;
+    }
+
+    return (
+      'mode' in result &&
+      (result as { mode?: unknown }).mode === 'workspace' &&
+      'verdict' in result &&
+      (result as { verdict?: unknown }).verdict === 'failed'
+    );
+  }
+
+  private async ensureRegistered(): Promise<void> {
+    await this.registrationPromise;
+    if (this.registrationError) {
+      throw this.registrationError;
+    }
+  }
+
+  private async runHeartbeatTick(): Promise<void> {
+    try {
+      await this.sendHeartbeat();
+
+      if (this.currentTask) {
+        this.emit('progress', {
+          taskId: this.currentTask.id,
+          progress: -1,
+          message: '心跳',
+          chatId: this.getTaskChatId(this.currentTask),
+        } as WorkerProgressEvent);
       }
+    } catch (error) {
+      this.emit('heartbeat-error', error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private async withCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) {
+      throw toTaskCancelledError(signal.reason);
     }
 
-    if (sections.length === 0) {
-      return null;
-    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(toTaskCancelledError(signal.reason));
+      };
 
-    return sections.join('\n\n');
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        }
+      );
+    });
   }
 }
 

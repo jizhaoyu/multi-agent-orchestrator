@@ -182,6 +182,10 @@ export class CodexAPIClient implements LLMClient<Required<CodexAPIConfig>> {
 
   private handleError(error: unknown): Error {
     if (error instanceof Error) {
+      const formatted = formatErrorWithCause(error);
+      if (formatted !== error.message) {
+        return new Error(formatted);
+      }
       return error;
     }
     return new Error(String(error));
@@ -204,10 +208,46 @@ function isRetryableError(error: Error): boolean {
     message.includes('504') ||
     message.includes('network') ||
     message.includes('econnreset') ||
-    message.includes('socket hang up')
+    message.includes('socket hang up') ||
+    message.includes('und_err_socket') ||
+    message.includes('other side closed')
   );
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatErrorWithCause(error: Error): string {
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (!(cause instanceof Error)) {
+    return error.message;
+  }
+
+  const details = [cause.message];
+  const causeCode = getStringField(cause, 'code');
+  const causeAddress = getStringField(cause, 'address');
+  const causePort = getNumberField(cause, 'port');
+
+  if (causeCode) {
+    details.unshift(causeCode);
+  }
+
+  if (causeAddress) {
+    details.push(
+      causePort !== undefined ? `(${causeAddress}:${causePort})` : `(${causeAddress})`
+    );
+  }
+
+  return `${error.message}: ${details.join(' ')}`;
+}
+
+function getStringField(value: object, key: string): string | undefined {
+  const record = value as Record<string, unknown>;
+  return typeof record[key] === 'string' ? record[key] : undefined;
+}
+
+function getNumberField(value: object, key: string): number | undefined {
+  const record = value as Record<string, unknown>;
+  return typeof record[key] === 'number' ? record[key] : undefined;
 }

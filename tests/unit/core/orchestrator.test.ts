@@ -294,6 +294,44 @@ describe('Orchestrator', () => {
     });
   });
 
+  it('should interrupt running workers when cancelling a task tree', async () => {
+    const task: ITask = {
+      id: 'task-running',
+      parentId: null,
+      assignedTo: 'worker-1',
+      status: 'pending',
+      priority: 'high',
+      depth: 0,
+      description: 'Long running task',
+      context: {},
+      result: null,
+      error: null,
+      createdAt: new Date(),
+      startedAt: null,
+      completedAt: null,
+    };
+
+    await taskManager.addTask(task);
+
+    const worker = workers[0];
+    if (!worker) {
+      throw new Error('worker-1 not found');
+    }
+
+    await worker.receiveTask(task);
+    const cancelSpy = vi.spyOn(worker, 'cancelCurrentTask').mockResolvedValue(true);
+
+    const result = await orchestrator.cancelTaskTree(task.id, '任务已被 Telegram 用户取消');
+
+    expect(cancelSpy).toHaveBeenCalledWith('任务已被 Telegram 用户取消');
+    expect(result).toMatchObject({
+      rootTaskFound: true,
+      cancelledPendingCount: 0,
+      runningCount: 1,
+      interruptedRunningCount: 1,
+    });
+  });
+
   it('should review results', async () => {
     const task: ITask = {
       id: 'task-1',
@@ -368,12 +406,64 @@ describe('Orchestrator', () => {
         startedAt: null,
         completedAt: null,
       },
+      {
+        id: 'task-3',
+        parentId: null,
+        assignedTo: null,
+        status: 'failed',
+        priority: 'medium',
+        depth: 0,
+        description: 'Task 3',
+        context: {},
+        result: {
+          mode: 'workspace',
+          summary: 'Verification failed',
+        },
+        error: 'Verification failed',
+        createdAt: new Date(),
+        startedAt: null,
+        completedAt: null,
+      },
     ];
 
     const integrated = await orchestrator.integrateResults(tasks);
 
-    expect(integrated).toHaveProperty('totalTasks', 2);
+    expect(integrated).toHaveProperty('totalTasks', 3);
     expect(integrated).toHaveProperty('completedTasks', 2);
+    expect(integrated).toHaveProperty('failedTasks', 1);
+    expect(integrated).toHaveProperty('failures');
+    expect(integrated).toHaveProperty('finalOpinion', '📌 结论\n- Mock response。');
+    expect((integrated as { failures: Array<{ error: string }> }).failures[0]?.error).toBe(
+      'Verification failed'
+    );
+  });
+
+  it('should reassign and execute a failed task during error handling', async () => {
+    const task: ITask = {
+      id: 'task-retry',
+      parentId: null,
+      assignedTo: 'worker-1',
+      status: 'running',
+      priority: 'high',
+      depth: 0,
+      description: 'Retry me',
+      context: {},
+      result: null,
+      error: 'previous failure',
+      createdAt: new Date(),
+      startedAt: new Date(),
+      completedAt: null,
+    };
+
+    await taskManager.addTask(task);
+
+    await orchestrator.handleError(task, new Error('worker crashed'));
+
+    await expect(taskManager.getTask(task.id)).resolves.toMatchObject({
+      status: 'completed',
+      assignedTo: expect.stringMatching(/^worker-\d+$/),
+      error: null,
+    });
   });
 
   it('should start and stop monitoring', async () => {

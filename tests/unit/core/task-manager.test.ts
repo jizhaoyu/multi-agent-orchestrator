@@ -59,6 +59,17 @@ describe('TaskManager', () => {
     expect(next?.id).toBe('task-2'); // high priority
   });
 
+  it('should skip blocked pending tasks when selecting the next task', async () => {
+    const parent = createTask('parent', 'high');
+    parent.status = 'running';
+    await manager.addTask(parent);
+    await manager.addTask(createTask('blocked-child', 'high', 'parent'));
+    await manager.addTask(createTask('ready-task', 'medium'));
+
+    const next = await manager.getNextTask();
+    expect(next?.id).toBe('ready-task');
+  });
+
   it('should update task status', async () => {
     const task = createTask('task-1', 'high');
     await manager.addTask(task);
@@ -126,6 +137,28 @@ describe('TaskManager', () => {
     const task = await manager.getTask('task-1');
     expect(task?.assignedTo).toBe('worker-1');
     expect(task?.status).toBe('running');
+  });
+
+  it('should reset a task for retry', async () => {
+    const task = createTask('task-retry', 'high');
+    task.status = 'failed';
+    task.assignedTo = 'worker-1';
+    task.result = { summary: 'failed before retry' };
+    task.error = 'boom';
+    task.startedAt = new Date();
+    task.completedAt = new Date();
+    await manager.addTask(task);
+
+    await manager.resetTaskForRetry(task.id);
+
+    await expect(manager.getTask(task.id)).resolves.toMatchObject({
+      status: 'pending',
+      assignedTo: null,
+      result: null,
+      error: null,
+      startedAt: null,
+      completedAt: null,
+    });
   });
 
   it('should get stats', async () => {

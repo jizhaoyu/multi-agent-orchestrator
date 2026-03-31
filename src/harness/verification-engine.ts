@@ -1,5 +1,5 @@
 import type { ITask } from '@/types';
-import { assertCommandAllowed } from './permissions';
+import { assertCommandAllowed, isCommandAllowed } from './permissions';
 import type {
   CommandExecutionResult,
   FailureClass,
@@ -156,7 +156,7 @@ export class VerificationEngine {
       return policy.commands;
     }
 
-    const commands: Array<VerificationCommand | null> = (input.verification || [])
+    const customCommands: Array<VerificationCommand | null> = (input.verification || [])
       .map((command, index) => {
         const trimmed = command.trim();
         if (!looksExecutableCommand(trimmed)) {
@@ -172,7 +172,21 @@ export class VerificationEngine {
         };
       });
 
-    return commands.filter(isVerificationCommand);
+    const commands = customCommands.filter(isVerificationCommand);
+    if (commands.length === 0) {
+      return createSafeFallbackVerificationCommands(input.changedFiles);
+    }
+
+    const allowedCommands = commands.filter((command) =>
+      isCommandAllowed(command.command, this.config.permissionProfile)
+    );
+
+    if (allowedCommands.length > 0) {
+      return allowedCommands;
+    }
+
+    const fallbackCommands = createSafeFallbackVerificationCommands(input.changedFiles);
+    return fallbackCommands.length > 0 ? fallbackCommands : commands;
   }
 
   private async finalizeVerification(
@@ -331,6 +345,64 @@ function inferTaskType(changedFiles: string[]): string {
 
 function looksExecutableCommand(command: string): boolean {
   return /[A-Za-z]/.test(command) && !command.includes('读取成功');
+}
+
+function createSafeFallbackVerificationCommands(changedFiles: string[]): VerificationCommand[] {
+  const normalizedFiles = normalizeChangedFilesForFallback(changedFiles);
+  if (!canUseGeneratedFileChecks(normalizedFiles)) {
+    return [];
+  }
+
+  return [
+    {
+      id: 'generated-file-check',
+      label: 'Generated file checks',
+      command: buildNodeFileVerificationCommand(normalizedFiles),
+      kind: 'custom',
+      required: true,
+    },
+  ];
+}
+
+function normalizeChangedFilesForFallback(changedFiles: string[]): string[] {
+  const normalized = changedFiles
+    .map((filePath) => filePath.trim().replace(/\\/g, '/'))
+    .filter(Boolean);
+
+  return [...new Set(normalized)];
+}
+
+function canUseGeneratedFileChecks(changedFiles: string[]): boolean {
+  if (changedFiles.length === 0) {
+    return false;
+  }
+
+  return changedFiles.every((filePath) => {
+    const lower = filePath.toLowerCase();
+    return (
+      lower.endsWith('.md') ||
+      lower.endsWith('.txt') ||
+      lower.endsWith('.json') ||
+      lower.endsWith('.yaml') ||
+      lower.endsWith('.yml') ||
+      lower.endsWith('.csv')
+    );
+  });
+}
+
+function buildNodeFileVerificationCommand(changedFiles: string[]): string {
+  const encodedFiles = Buffer.from(JSON.stringify(changedFiles), 'utf-8').toString('base64');
+  const script = [
+    "const fs=require('fs');",
+    "const files=JSON.parse(Buffer.from(process.argv[1],'base64').toString('utf8'));",
+    "for(const file of files){",
+    "const stat=fs.statSync(file);",
+    "if(!stat.isFile()||stat.size<=0){throw new Error('Invalid file: '+file);}",
+    "}",
+    "console.log('verified-files-exist-and-nonempty');",
+  ].join('');
+
+  return `node -e "${script}" ${encodedFiles}`;
 }
 
 function isVerificationCommand(

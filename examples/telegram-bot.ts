@@ -93,6 +93,7 @@ async function main() {
     chatId: process.env.TELEGRAM_CHAT_ID,
     defaultWorkspaceRoot: workspaceRoot,
     projectSearchRoots: resolveProjectSearchRoots(workspaceRoot),
+    executionUpdatesMode: 'silent',
     proxyUrl:
       process.env.TELEGRAM_PROXY_URL ||
       process.env.HTTPS_PROXY ||

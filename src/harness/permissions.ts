@@ -109,3 +109,20 @@ export function assertCommandAllowed(
     );
   }
 }
+
+export function isCommandAllowed(
+  command: string,
+  profile: PermissionProfile = 'dev_safe'
+): boolean {
+  const normalized = command.trim();
+  if (!normalized) {
+    return false;
+  }
+
+  if (DENIED_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  const definition = getPermissionProfileDefinition(profile);
+  return definition.allowedPatterns.some((pattern) => pattern.test(normalized));
+}

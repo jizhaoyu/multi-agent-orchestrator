@@ -158,14 +158,15 @@ describe('WorkspaceExecutor', () => {
 
   it('should force a revision loop when files changed without verification commands', async () => {
     const workspaceRoot = await createTempWorkspace();
+    await fs.writeFile(path.join(workspaceRoot, 'app.ts'), 'export const value = 1;\n', 'utf-8');
     const apiClient = createQueuedClient([
       {
         type: 'write_files',
         reason: 'apply requested change',
         writes: [
           {
-            path: 'README.md',
-            content: 'updated via loop',
+            path: 'app.ts',
+            content: 'export const value = 2;\n',
           },
         ],
       },
@@ -187,7 +188,7 @@ describe('WorkspaceExecutor', () => {
       maxIterations: 6,
     });
 
-    const result = await executor.executeTask(createTask('修改 README 并通过验证'));
+    const result = await executor.executeTask(createTask('修改 app.ts 并通过验证'));
     const sendMessageMock = apiClient.sendMessage as ReturnType<typeof vi.fn>;
 
     expect(result.summary).toBe('补齐验证后完成。');
@@ -244,6 +245,42 @@ describe('WorkspaceExecutor', () => {
     expect(result.verdict).toBe('passed');
     expect(result.verification).toEqual(['node -e "console.log(\'policy-verify\')"']);
     expect(result.commandResults.at(-1)?.stdout).toContain('policy-verify');
+  });
+
+  it('should replace unsafe custom verification commands with a safe generated file check for docs', async () => {
+    const workspaceRoot = await createTempWorkspace();
+    await fs.writeFile(path.join(workspaceRoot, 'README.md'), 'old content', 'utf-8');
+
+    const executor = new WorkspaceExecutor({
+      workspaceRoot,
+      apiClient: createQueuedClient([
+        {
+          type: 'write_files',
+          reason: 'update markdown output',
+          writes: [
+            {
+              path: 'README.md',
+              content: 'new content',
+            },
+          ],
+        },
+        {
+          type: 'finish',
+          reason: 'done',
+          summary: '文档已写完。',
+          changedFiles: ['README.md'],
+          verification: ['powershell -NoProfile -Command "Write-Output blocked"'],
+        },
+      ]),
+      maxIterations: 4,
+    });
+
+    const result = await executor.executeTask(createTask('输出 markdown 文档'));
+
+    expect(result.verdict).toBe('passed');
+    expect(result.verification).toHaveLength(1);
+    expect(result.verification[0]).toContain('node -e');
+    expect(result.commandResults.at(-1)?.stdout).toContain('verified-files-exist-and-nonempty');
   });
 
   it('should block commands outside the allowlist', async () => {

@@ -23,6 +23,7 @@ import {
   type VerificationPolicy,
   type VerificationResult,
 } from '@/harness';
+import { isTaskCancelledError, toTaskCancelledError } from './task-cancelled-error';
 
 const exec = promisify(execCallback);
 
@@ -172,6 +173,7 @@ export class WorkspaceExecutor {
   };
   private readonly verificationEngine: VerificationEngine;
   private readonly failureMemory: FailureMemoryStore | null;
+  private activeAbortSignal: AbortSignal | null = null;
 
   constructor(config: WorkspaceExecutorConfig) {
     const workspaceHarnessConfig = loadWorkspaceHarnessConfig(config.workspaceRoot);
@@ -218,7 +220,8 @@ export class WorkspaceExecutor {
     });
   }
 
-  async executeTask(task: ITask): Promise<WorkspaceExecutionResult> {
+  async executeTask(task: ITask, signal?: AbortSignal): Promise<WorkspaceExecutionResult> {
+    this.activeAbortSignal = signal ?? null;
     const state: ExecutionState = {
       traceId: createTraceId('task'),
       taskId: task.id,
@@ -235,216 +238,228 @@ export class WorkspaceExecutor {
       },
     };
 
-    state.observations.push(`工作区根目录: ${this.config.workspaceRoot}`);
-    state.observations.push(`目录结构:\n${await this.buildWorkspaceTree()}`);
-    await this.reportProgress({
-      progress: 5,
-      message: `已加载项目目录 ${path.basename(this.config.workspaceRoot) || this.config.workspaceRoot}`,
-      step: 0,
-      actionType: 'setup',
-    });
-
-    const gitStatus = await this.tryGetGitStatus();
-    if (gitStatus) {
-      state.observations.push(`Git 状态:\n${gitStatus}`);
-    }
-
-    const recentFailures = await this.failureMemory?.getRecentSummaries(2);
-    if (recentFailures && recentFailures.length > 0) {
-      state.observations.push(`最近失败记忆:\n${recentFailures.join('\n\n')}`);
-    }
-
-    for (let step = 1; step <= this.config.maxIterations; step++) {
-      await this.config.traceRecorder?.record({
-        trace_id: state.traceId,
-        task_id: task.id,
-        attempt_id: `step-${step}`,
-        kind: 'before_prompt',
-        role: 'workspace-controller',
-        message: `workspace-step-${step}`,
+    try {
+      this.throwIfCancelled();
+      state.observations.push(`工作区根目录: ${this.config.workspaceRoot}`);
+      state.observations.push(`目录结构:\n${await this.buildWorkspaceTree()}`);
+      await this.reportProgress({
+        progress: 5,
+        message: `已加载项目目录 ${path.basename(this.config.workspaceRoot) || this.config.workspaceRoot}`,
+        step: 0,
+        actionType: 'setup',
       });
 
-      const promptStartedAt = Date.now();
-      const response = await this.config.apiClient.sendMessage(
-        [
-          {
-            role: 'user',
-            content: this.buildActionPrompt(task, state, step),
+      const gitStatus = await this.tryGetGitStatus();
+      if (gitStatus) {
+        state.observations.push(`Git 状态:\n${gitStatus}`);
+      }
+
+      const recentFailures = await this.failureMemory?.getRecentSummaries(2);
+      if (recentFailures && recentFailures.length > 0) {
+        state.observations.push(`最近失败记忆:\n${recentFailures.join('\n\n')}`);
+      }
+
+      for (let step = 1; step <= this.config.maxIterations; step++) {
+        this.throwIfCancelled();
+
+        await this.config.traceRecorder?.record({
+          trace_id: state.traceId,
+          task_id: task.id,
+          attempt_id: `step-${step}`,
+          kind: 'before_prompt',
+          role: 'workspace-controller',
+          message: `workspace-step-${step}`,
+        });
+
+        const promptStartedAt = Date.now();
+        const response = await this.withCancellation(
+          this.config.apiClient.sendMessage(
+            [
+              {
+                role: 'user',
+                content: this.buildActionPrompt(task, state, step),
+              },
+            ],
+            {
+              system: getWorkspaceControllerSystemPrompt(),
+            }
+          )
+        );
+        await this.config.traceRecorder?.record({
+          trace_id: state.traceId,
+          task_id: task.id,
+          attempt_id: `step-${step}`,
+          kind: 'after_response',
+          role: 'workspace-controller',
+          duration_ms: Date.now() - promptStartedAt,
+          token_in: response.tokensUsed.input,
+          token_out: response.tokensUsed.output,
+          message: response.stopReason || 'stop',
+          metadata: {
+            model: response.model,
           },
-        ],
-        {
-          system: getWorkspaceControllerSystemPrompt(),
-        }
-      );
-      await this.config.traceRecorder?.record({
-        trace_id: state.traceId,
-        task_id: task.id,
-        attempt_id: `step-${step}`,
-        kind: 'after_response',
-        role: 'workspace-controller',
-        duration_ms: Date.now() - promptStartedAt,
-        token_in: response.tokensUsed.input,
-        token_out: response.tokensUsed.output,
-        message: response.stopReason || 'stop',
-        metadata: {
-          model: response.model,
-        },
-      });
+        });
 
-      state.tokenUsage.input += response.tokensUsed.input;
-      state.tokenUsage.output += response.tokensUsed.output;
-      state.tokenUsage.total += response.tokensUsed.total;
+        state.tokenUsage.input += response.tokensUsed.input;
+        state.tokenUsage.output += response.tokensUsed.output;
+        state.tokenUsage.total += response.tokensUsed.total;
 
-      const action = this.parseAction(response.content);
-      await this.reportProgress({
-        progress: this.getActionProgress(step),
-        message: this.describeAction(action),
-        step,
-        actionType: action.type,
-      });
+        const action = this.parseAction(response.content);
+        await this.reportProgress({
+          progress: this.getActionProgress(step),
+          message: this.describeAction(action),
+          step,
+          actionType: action.type,
+        });
 
-      if (action.type === 'read_files') {
-        await this.handleReadFiles(action, state);
-        continue;
-      }
-
-      if (action.type === 'find_files') {
-        await this.handleFindFiles(action, state);
-        continue;
-      }
-
-      if (action.type === 'write_files') {
-        await this.handleWriteFiles(action, state);
-        continue;
-      }
-
-      if (action.type === 'run_command') {
-        await this.handleRunCommand(action, state);
-        continue;
-      }
-
-      await this.reportProgress({
-        progress: 95,
-        message: '正在整理执行结果',
-        step,
-        actionType: 'finish',
-      });
-      const changedFiles = this.mergeChangedFiles(state, action.changedFiles);
-      const attemptId = `finish-${step}`;
-      const verification = await this.verificationEngine.verifyCompletion({
-        task,
-        changedFiles,
-        verification: action.verification,
-        summary: action.summary,
-        notes: action.notes,
-        attemptId,
-      });
-      state.verification = verification;
-      state.lastRevisionPrompt = verification.revisionPrompt;
-      state.commandResults.push(
-        ...verification.checks.map((check) => ({
-          command: check.command,
-          exitCode: check.exitCode,
-          ok: check.ok,
-          stdout: check.stdout,
-          stderr: check.stderr,
-        }))
-      );
-
-      if (verification.verdict === 'failed') {
-        state.observations.push(`Verifier verdict: failed\n${verification.summary}`);
-        if (verification.revisionPrompt) {
-          state.observations.push(verification.revisionPrompt);
+        if (action.type === 'read_files') {
+          await this.handleReadFiles(action, state);
+          continue;
         }
 
-        await this.config.hooks?.taskFailed?.({
+        if (action.type === 'find_files') {
+          await this.handleFindFiles(action, state);
+          continue;
+        }
+
+        if (action.type === 'write_files') {
+          await this.handleWriteFiles(action, state);
+          continue;
+        }
+
+        if (action.type === 'run_command') {
+          await this.handleRunCommand(action, state);
+          continue;
+        }
+
+        await this.reportProgress({
+          progress: 95,
+          message: '正在整理执行结果',
+          step,
+          actionType: 'finish',
+        });
+        this.throwIfCancelled();
+        const changedFiles = this.mergeChangedFiles(state, action.changedFiles);
+        const attemptId = `finish-${step}`;
+        const verification = await this.withCancellation(
+          this.verificationEngine.verifyCompletion({
+            task,
+            changedFiles,
+            verification: action.verification,
+            summary: action.summary,
+            notes: action.notes,
+            attemptId,
+          })
+        );
+        state.verification = verification;
+        state.lastRevisionPrompt = verification.revisionPrompt;
+        state.commandResults.push(
+          ...verification.checks.map((check) => ({
+            command: check.command,
+            exitCode: check.exitCode,
+            ok: check.ok,
+            stdout: check.stdout,
+            stderr: check.stderr,
+          }))
+        );
+
+        if (verification.verdict === 'failed') {
+          state.observations.push(`Verifier verdict: failed\n${verification.summary}`);
+          if (verification.revisionPrompt) {
+            state.observations.push(verification.revisionPrompt);
+          }
+
+          await this.config.hooks?.taskFailed?.({
+            traceId: state.traceId,
+            taskId: task.id,
+            attemptId,
+            verdict: verification.verdict,
+            failureClass: verification.failureClass,
+            message: verification.summary,
+          });
+          await this.config.traceRecorder?.record({
+            trace_id: state.traceId,
+            task_id: task.id,
+            attempt_id: attemptId,
+            kind: 'task_failed',
+            verdict: verification.verdict,
+            failure_class: verification.failureClass,
+            message: verification.summary,
+          });
+
+          if (step < this.config.maxIterations) {
+            continue;
+          }
+
+          return {
+            mode: 'workspace',
+            traceId: state.traceId,
+            attemptId,
+            summary: verification.summary,
+            changedFiles,
+            verification: verification.executedCommands,
+            checks: verification.checks,
+            verdict: verification.verdict,
+            failureClass: verification.failureClass,
+            revisionPrompt: verification.revisionPrompt,
+            notes: [...(action.notes || []), verification.summary],
+            commandResults: state.commandResults,
+            tokenUsage: state.tokenUsage,
+          };
+        }
+
+        await this.config.hooks?.taskCompleted?.({
           traceId: state.traceId,
           taskId: task.id,
           attemptId,
           verdict: verification.verdict,
           failureClass: verification.failureClass,
-          message: verification.summary,
+          message: action.summary || action.reason || '任务执行完成。',
         });
         await this.config.traceRecorder?.record({
           trace_id: state.traceId,
           task_id: task.id,
           attempt_id: attemptId,
-          kind: 'task_failed',
+          kind: 'task_completed',
           verdict: verification.verdict,
-          failure_class: verification.failureClass,
-          message: verification.summary,
+          message: action.summary || action.reason || '任务执行完成。',
         });
-
-        if (step < this.config.maxIterations) {
-          continue;
-        }
 
         return {
           mode: 'workspace',
           traceId: state.traceId,
           attemptId,
-          summary: action.summary || action.reason || verification.summary,
+          summary: action.summary || action.reason || '任务执行完成。',
           changedFiles,
           verification: verification.executedCommands,
           checks: verification.checks,
           verdict: verification.verdict,
           failureClass: verification.failureClass,
           revisionPrompt: verification.revisionPrompt,
-          notes: [...(action.notes || []), verification.summary],
+          notes: action.notes || [],
           commandResults: state.commandResults,
           tokenUsage: state.tokenUsage,
         };
       }
 
-      await this.config.hooks?.taskCompleted?.({
-        traceId: state.traceId,
-        taskId: task.id,
-        attemptId,
-        verdict: verification.verdict,
-        failureClass: verification.failureClass,
-        message: action.summary || action.reason || '任务执行完成。',
-      });
-      await this.config.traceRecorder?.record({
-        trace_id: state.traceId,
-        task_id: task.id,
-        attempt_id: attemptId,
-        kind: 'task_completed',
-        verdict: verification.verdict,
-        message: action.summary || action.reason || '任务执行完成。',
-      });
-
       return {
         mode: 'workspace',
         traceId: state.traceId,
-        attemptId,
-        summary: action.summary || action.reason || '任务执行完成。',
-        changedFiles,
-        verification: verification.executedCommands,
-        checks: verification.checks,
-        verdict: verification.verdict,
-        failureClass: verification.failureClass,
-        revisionPrompt: verification.revisionPrompt,
-        notes: action.notes || [],
+        attemptId: null,
+        summary: '达到最大执行轮数，已停止自动执行。',
+        changedFiles: [...state.changedFiles],
+        verification: [],
+        checks: state.verification?.checks || [],
+        verdict: state.verification?.verdict || 'failed',
+        failureClass: state.verification?.failureClass || 'unexpected_error',
+        revisionPrompt: state.lastRevisionPrompt,
+        notes: ['建议检查当前修改结果，并视情况继续执行。'],
         commandResults: state.commandResults,
         tokenUsage: state.tokenUsage,
       };
+    } finally {
+      this.activeAbortSignal = null;
     }
-
-    return {
-      mode: 'workspace',
-      traceId: state.traceId,
-      attemptId: null,
-      summary: '达到最大执行轮数，已停止自动执行。',
-      changedFiles: [...state.changedFiles],
-      verification: [],
-      checks: state.verification?.checks || [],
-      verdict: state.verification?.verdict || 'failed',
-      failureClass: state.verification?.failureClass || 'unexpected_error',
-      revisionPrompt: state.lastRevisionPrompt,
-      notes: ['建议检查当前修改结果，并视情况继续执行。'],
-      commandResults: state.commandResults,
-      tokenUsage: state.tokenUsage,
-    };
   }
 
   private buildActionPrompt(task: ITask, state: ExecutionState, step: number): string {
@@ -473,6 +488,7 @@ export class WorkspaceExecutor {
     action: Extract<PlannerAction, { type: 'read_files' }>,
     state: ExecutionState
   ): Promise<void> {
+    this.throwIfCancelled();
     const startedAt = Date.now();
     await this.recordBeforeTool(state, action.type, {
       files: action.files,
@@ -487,6 +503,7 @@ export class WorkspaceExecutor {
 
     const contents = await Promise.all(
       files.map(async (filePath) => {
+        this.throwIfCancelled();
         try {
           const absolutePath = this.resolveWorkspacePath(filePath);
           const content = await fs.readFile(absolutePath, 'utf-8');
@@ -519,6 +536,7 @@ export class WorkspaceExecutor {
     action: Extract<PlannerAction, { type: 'find_files' }>,
     state: ExecutionState
   ): Promise<void> {
+    this.throwIfCancelled();
     const startedAt = Date.now();
     await this.recordBeforeTool(state, action.type, {
       query: action.query,
@@ -550,6 +568,7 @@ export class WorkspaceExecutor {
     action: Extract<PlannerAction, { type: 'write_files' }>,
     state: ExecutionState
   ): Promise<void> {
+    this.throwIfCancelled();
     const startedAt = Date.now();
     await this.recordBeforeTool(state, action.type, {
       files: action.writes.map((write) => write.path),
@@ -563,6 +582,7 @@ export class WorkspaceExecutor {
     const changedPaths: string[] = [];
 
     for (const write of action.writes) {
+      this.throwIfCancelled();
       const relativePath = this.normalizeRelativePath(write.path);
       const absolutePath = this.resolveWorkspacePath(relativePath);
       await fs.mkdir(path.dirname(absolutePath), { recursive: true });
@@ -581,6 +601,7 @@ export class WorkspaceExecutor {
     action: Extract<PlannerAction, { type: 'run_command' }>,
     state: ExecutionState
   ): Promise<void> {
+    this.throwIfCancelled();
     const command = action.command.trim();
     const startedAt = Date.now();
     await this.recordBeforeTool(state, action.type, {
@@ -617,6 +638,7 @@ export class WorkspaceExecutor {
         cwd: this.config.workspaceRoot,
         timeout: this.config.commandTimeoutMs,
         maxBuffer: 1024 * 1024,
+        signal: this.activeAbortSignal ?? undefined,
         env: {
           ...process.env,
           CI: process.env.CI || '1',
@@ -637,6 +659,10 @@ export class WorkspaceExecutor {
         stdout?: string;
         stderr?: string;
       };
+
+      if (this.activeAbortSignal?.aborted || isAbortExecutionError(execError)) {
+        throw toTaskCancelledError(this.activeAbortSignal?.reason ?? execError);
+      }
 
       return {
         command,
@@ -755,6 +781,39 @@ export class WorkspaceExecutor {
 
   private normalizeRelativePath(filePath: string): string {
     return filePath.replace(/\\/g, '/').replace(/^\.\/+/, '');
+  }
+
+  private throwIfCancelled(): void {
+    if (this.activeAbortSignal?.aborted) {
+      throw toTaskCancelledError(this.activeAbortSignal.reason);
+    }
+  }
+
+  private async withCancellation<T>(promise: Promise<T>): Promise<T> {
+    this.throwIfCancelled();
+    const signal = this.activeAbortSignal;
+
+    if (!signal) {
+      return promise;
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(toTaskCancelledError(signal.reason));
+      };
+
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(isTaskCancelledError(error) ? error : error);
+        }
+      );
+    });
   }
 
   private async findFiles(query: string, limit: number): Promise<string[]> {
@@ -1184,4 +1243,9 @@ function isSubsequence(needle: string, haystack: string): boolean {
   }
 
   return false;
+}
+
+function isAbortExecutionError(error: Error): boolean {
+  const errorWithCode = error as Error & { code?: string };
+  return error.name === 'AbortError' || errorWithCode.code === 'ABORT_ERR';
 }

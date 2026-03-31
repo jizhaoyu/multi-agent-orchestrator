@@ -7,8 +7,13 @@ import TelegramBot from 'node-telegram-bot-api';
 import { EventEmitter } from 'events';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import type { Orchestrator } from '@/core/orchestrator';
-import type { Worker } from '@/core/worker';
+import type {
+  IntegratedTaskFailureSummary,
+  IntegratedTaskResultSummary,
+  IntegratedTaskSummary,
+  Orchestrator,
+} from '@/core/orchestrator';
+import type { Worker, WorkerProgressEvent } from '@/core/worker';
 import type { ConversationTurn, TaskDifficulty, TaskExecutionPlan } from '@/types';
 
 /**
@@ -41,6 +46,9 @@ export interface TelegramBotConfig {
 
   /** 启动时是否跳过积压消息 */
   dropPendingUpdatesOnStart?: boolean;
+
+  /** 执行消息可见性：silent 仅回执与最终结果，verbose 输出完整过程 */
+  executionUpdatesMode?: 'silent' | 'verbose';
 }
 
 /**
@@ -84,10 +92,11 @@ interface TaskLifecycleLogEntry {
  */
 export class TelegramBotIntegration extends EventEmitter {
   private bot: TelegramBot;
-  private config: Omit<TelegramBotConfig, 'polling' | 'dropPendingUpdatesOnStart' | 'projectSearchRoots'> & {
+  private config: Omit<TelegramBotConfig, 'polling' | 'dropPendingUpdatesOnStart' | 'projectSearchRoots' | 'executionUpdatesMode'> & {
     polling: boolean;
     dropPendingUpdatesOnStart: boolean;
     projectSearchRoots: string[];
+    executionUpdatesMode: 'silent' | 'verbose';
   };
   private isRunning = false;
   private readonly conversationHistory = new Map<string, ConversationTurn[]>();
@@ -95,6 +104,7 @@ export class TelegramBotIntegration extends EventEmitter {
   private readonly chatExecutionStates = new Map<string, ChatExecutionState>();
   private readonly chatLifecycleLogs = new Map<string, TaskLifecycleLogEntry[]>();
   private readonly lastWorkerProgress = new Map<string, string>();
+  private readonly attachedWorkerListeners = new Set<string>();
   private readonly maxConversationTurns = 8;
   private pollingConflictHandled = false;
   private readonly botCommands: TelegramBot.BotCommand[] = [
@@ -124,7 +134,7 @@ export class TelegramBotIntegration extends EventEmitter {
     },
     {
       command: 'cancel',
-      description: '取消当前聊天任务',
+      description: '实时中断当前聊天任务',
     },
     {
       command: 'status',
@@ -155,6 +165,7 @@ export class TelegramBotIntegration extends EventEmitter {
       ...config,
       polling: config.polling ?? true,
       dropPendingUpdatesOnStart: config.dropPendingUpdatesOnStart ?? true,
+      executionUpdatesMode: config.executionUpdatesMode ?? 'silent',
       projectSearchRoots: this.normalizeProjectSearchRoots(
         config.projectSearchRoots,
         config.defaultWorkspaceRoot
@@ -358,6 +369,10 @@ export class TelegramBotIntegration extends EventEmitter {
       return;
     }
 
+    if (await this.handleDirectConversation(chatId, text, msg)) {
+      return;
+    }
+
     // 解析 @mention
     const mention = this.parseMention(text);
 
@@ -464,13 +479,18 @@ export class TelegramBotIntegration extends EventEmitter {
 
     // 监听 Orchestrator 事件
     this.config.orchestrator.on('task-decomposed', async (task, subtasks) => {
-      if (this.config.chatId) {
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
+      }
+
+      const chatId = this.resolveTaskChatId(task);
+      if (chatId) {
         const plan = this.getTaskExecutionPlan(task);
         const maxConcurrentWorkers = this.resolveRecommendedWorkers(
           task,
           subtasks.length > 0 ? subtasks.length : 1
         );
-        await this.sendWorkflowStageUpdate(this.config.chatId, '分配中', [
+        await this.sendWorkflowStageUpdate(chatId, '分配中', [
           subtasks.length > 0
             ? `已拆分出 ${subtasks.length} 个执行单元`
             : '未拆分出子任务，准备直接执行原始任务',
@@ -481,49 +501,23 @@ export class TelegramBotIntegration extends EventEmitter {
     });
 
     this.config.orchestrator.on('task-assigned', async (task, worker) => {
-      if (this.config.chatId) {
-        await this.sendTaskAssignment(this.config.chatId, worker.id, task.description);
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
       }
+
+      const chatId = this.resolveTaskChatId(task);
+      if (chatId) {
+        await this.sendTaskAssignment(chatId, worker.id, task.description);
+      }
+    });
+
+    this.config.orchestrator.on('worker-created', (worker) => {
+      this.attachWorkerEventListeners(worker);
     });
 
     // 监听 Worker 事件
     for (const worker of this.config.workers) {
-      worker.on('progress', async (event) => {
-        const chatId = this.config.chatId;
-        if (
-          chatId &&
-          event.progress >= 0 &&
-          !(event.progress >= 100 && event.message === '任务完成') &&
-          this.shouldSendWorkerProgress(chatId, worker.id, event.progress, event.message)
-        ) {
-          await this.sendProgressUpdate(
-            chatId,
-            worker.id,
-            event.progress,
-            event.message
-          );
-        }
-      });
-
-      worker.on('task-completed', async (task) => {
-        const chatId = this.config.chatId;
-        if (chatId) {
-          this.clearWorkerProgress(chatId, worker.id);
-          await this.sendTaskCompletionMessages(chatId, worker.id, task);
-        }
-      });
-
-      worker.on('task-failed', async (task, error) => {
-        const chatId = this.config.chatId;
-        if (chatId) {
-          this.clearWorkerProgress(chatId, worker.id);
-          await this.sendMessage(chatId, {
-            type: 'error_report',
-            from: worker.id,
-            content: `❌ 任务失败: ${task.description}\n\n错误: ${error}`,
-          });
-        }
-      });
+      this.attachWorkerEventListeners(worker);
     }
   }
 
@@ -581,62 +575,141 @@ export class TelegramBotIntegration extends EventEmitter {
   }
 
   private formatSummary(summary: unknown): string {
+    const summaryRecord = this.normalizeIntegratedSummary(summary);
+    if (!summaryRecord) {
+      return '🎯 最终结论\n\n📌 结论\n- 任务已处理完成。';
+    }
+
+    const opinion = typeof summaryRecord.finalOpinion === 'string' && summaryRecord.finalOpinion.trim()
+      ? normalizeFinalOpinionBlock(summaryRecord.finalOpinion)
+      : this.buildExecutiveSummary(summaryRecord);
+
+    return ['🎯 最终结论', '', opinion].join('\n');
+  }
+
+  private normalizeIntegratedSummary(summary: unknown): IntegratedTaskSummary | null {
     if (
       typeof summary !== 'object' ||
       summary === null ||
       !('totalTasks' in summary) ||
       !('completedTasks' in summary)
     ) {
-      return '✅ 任务流程已结束。';
+      return null;
     }
 
     const summaryRecord = summary as {
       totalTasks: unknown;
       completedTasks: unknown;
+      failedTasks?: unknown;
+      finalOpinion?: unknown;
       results?: unknown;
+      failures?: unknown;
     };
-    const totalTasks = Number(summaryRecord.totalTasks) || 0;
-    const completedTasks = Number(summaryRecord.completedTasks) || 0;
-    const results = Array.isArray(summaryRecord.results) ? summaryRecord.results : [];
+    const results = Array.isArray(summaryRecord.results)
+      ? summaryRecord.results as IntegratedTaskResultSummary[]
+      : [];
+    const failures = Array.isArray(summaryRecord.failures)
+      ? summaryRecord.failures as IntegratedTaskFailureSummary[]
+      : [];
+
+    return {
+      totalTasks: normalizeSummaryCount(summaryRecord.totalTasks, results.length + failures.length),
+      completedTasks: normalizeSummaryCount(summaryRecord.completedTasks, results.length),
+      failedTasks: normalizeSummaryCount(summaryRecord.failedTasks, failures.length),
+      finalOpinion:
+        typeof summaryRecord.finalOpinion === 'string' ? summaryRecord.finalOpinion.trim() : undefined,
+      results,
+      failures,
+    };
+  }
+
+  private buildExecutiveSummary(summary: IntegratedTaskSummary): string {
+    const conciseSingleResult = this.getSingleResultOpinion(summary);
+    if (conciseSingleResult) {
+      return ['📌 结论', `- ${conciseSingleResult}`].join('\n');
+    }
+
+    const completedPoints = deduplicateStrings(
+      summary.results.flatMap((item) => this.extractExecutivePointsFromResult(item.result, 1))
+    ).slice(0, 3);
+    const failurePoints = deduplicateStrings(
+      summary.failures.flatMap((item) => this.extractExecutivePointsFromFailure(item, 1))
+    ).slice(0, 2);
+
+    if (completedPoints.length === 0 && failurePoints.length === 0) {
+      return ['📌 结论', '- 暂时没有形成可靠结论。'].join('\n');
+    }
+
+    if (completedPoints.length === 0) {
+      return [
+        '📌 结论',
+        `- 当前还不能给出可靠结论，主要问题是${joinAsChineseSeries(failurePoints)}。`,
+        '',
+        '💡 建议',
+        `- 优先处理${joinAsChineseSeries(failurePoints)}。`,
+      ].join('\n');
+    }
+
     const sections = [
-      '任务流程已结束',
-      '',
-      '概况',
-      `- 总任务数: ${totalTasks}`,
-      `- 完成任务数: ${completedTasks}`,
+      '📌 结论',
+      `- ${ensureSentenceEnding(completedPoints[0] || '已形成结论')}`,
     ];
 
-    const taskLines = results
-      .slice(0, 4)
-      .map((item: unknown, index) => {
-        const description =
-          typeof item === 'object' &&
-          item !== null &&
-          'description' in item &&
-          typeof (item as { description?: unknown }).description === 'string'
-            ? (item as { description: string }).description
-            : '子任务';
-        const detail = this.formatTaskResultPreview(
-          typeof item === 'object' && item !== null && 'result' in item
-            ? (item as { result?: unknown }).result
-            : undefined,
-          {
-            maxHighlights: 2,
-            includeFiles: false,
-            includeVerification: false,
-          }
-        );
-        const summaryLines = detail
-          ? indentBlock(detail, '  ')
-          : '  - 已完成';
-        return `${index + 1}. ${truncateMessage(description, 72)}\n${summaryLines}`;
-      });
+    if (completedPoints.length > 1) {
+      sections.push('', '📎 要点', ...completedPoints.slice(1).map((item) => `- ${ensureSentenceEnding(item)}`));
+    }
 
-    if (taskLines.length > 0) {
-      sections.push('', '结果摘要', ...taskLines);
+    if (failurePoints.length > 0) {
+      sections.push('', '⚠️ 风险', ...failurePoints.map((item) => `- ${ensureSentenceEnding(item)}`));
+      sections.push('', '💡 建议', `- 优先处理${joinAsChineseSeries(failurePoints)}。`);
     }
 
     return sections.join('\n');
+  }
+
+  private getSingleResultOpinion(summary: IntegratedTaskSummary): string | null {
+    if (summary.failedTasks > 0 || summary.results.length !== 1) {
+      return null;
+    }
+
+    const detail = this.extractTaskResultDetail(summary.results[0]?.result);
+    if (!detail) {
+      return null;
+    }
+
+    const compact = collapseWhitespace(detail.summary);
+    if (!compact || compact.length > 120) {
+      return null;
+    }
+
+    return ensureSentenceEnding(stripOpinionPrefix(compact));
+  }
+
+  private extractExecutivePointsFromResult(result: unknown, maxItems: number): string[] {
+    const detail = this.extractTaskResultDetail(result);
+    if (!detail) {
+      return [];
+    }
+
+    return extractHighlights(detail.summary, maxItems)
+      .map((item) => stripOpinionPrefix(item))
+      .map((item) => trimTrailingPunctuation(item))
+      .filter(Boolean);
+  }
+
+  private extractExecutivePointsFromFailure(
+    failure: IntegratedTaskFailureSummary,
+    maxItems: number
+  ): string[] {
+    const detail = this.extractTaskResultDetail(failure.result);
+    const detailPoints = detail
+      ? extractHighlights(detail.summary, maxItems).map((item) => trimTrailingPunctuation(item))
+      : [];
+
+    return [
+      trimTrailingPunctuation(stripOpinionPrefix(failure.error)),
+      ...detailPoints,
+    ].filter(Boolean);
   }
 
   private async sendTaskCompletionMessages(
@@ -676,6 +749,10 @@ export class TelegramBotIntegration extends EventEmitter {
       content: this.formatSummary(summary),
     });
 
+    if (!this.shouldEmitIntermediateExecutionUpdates()) {
+      return;
+    }
+
     const expandedContents = this.buildExpandedSummaryContents(summary);
     for (const content of expandedContents) {
       await this.sendChunkedMessage(chatId, {
@@ -692,16 +769,16 @@ export class TelegramBotIntegration extends EventEmitter {
     result: unknown;
   }): string {
     const sections = [
-      '任务完成',
+      '✅ 任务完成',
       '',
-      '任务',
+      '📝 任务',
       `- ${truncateMessage(task.description, 120)}`,
     ];
 
     const workspaceRoot =
       typeof task.context.workspaceRoot === 'string' ? task.context.workspaceRoot : '';
     if (workspaceRoot) {
-      sections.push('', '项目目录', workspaceRoot);
+      sections.push('', '📁 项目目录', workspaceRoot);
     }
 
     const detail = this.formatTaskResultPreview(task.result, {
@@ -728,26 +805,26 @@ export class TelegramBotIntegration extends EventEmitter {
     }
 
     const sections = [
-      '完整结果',
+      '📖 完整结果',
       '',
-      '任务',
+      '📝 任务',
       `- ${task.description}`,
     ];
 
     const workspaceRoot =
       typeof task.context.workspaceRoot === 'string' ? task.context.workspaceRoot : '';
     if (workspaceRoot) {
-      sections.push('', '项目目录', workspaceRoot);
+      sections.push('', '📁 项目目录', workspaceRoot);
     }
 
-    sections.push('', '结果全文', detail.summary);
+    sections.push('', '🧾 结果全文', detail.summary);
 
     if (detail.changedFiles.length > 0) {
-      sections.push('', '修改文件', ...detail.changedFiles.map((file) => `- ${file}`));
+      sections.push('', '🛠️ 修改文件', ...detail.changedFiles.map((file) => `- ${file}`));
     }
 
     if (detail.verification.length > 0) {
-      sections.push('', '验证', ...detail.verification.map((item) => `- ${item}`));
+      sections.push('', '✅ 验证', ...detail.verification.map((item) => `- ${item}`));
     }
 
     return sections.join('\n');
@@ -771,7 +848,7 @@ export class TelegramBotIntegration extends EventEmitter {
 
     if (highlights.length > 0) {
       sections.push(
-        '关键结果',
+        '✨ 关键结果',
         ...highlights.map((item) => `- ${item}`)
       );
     }
@@ -779,7 +856,7 @@ export class TelegramBotIntegration extends EventEmitter {
     if (options.includeFiles && detail.changedFiles.length > 0) {
       sections.push(
         '',
-        '修改文件',
+        '🛠️ 修改文件',
         ...detail.changedFiles.slice(0, 4).map((file: string) => `- ${file}`)
       );
     }
@@ -787,7 +864,7 @@ export class TelegramBotIntegration extends EventEmitter {
     if (options.includeVerification && detail.verification.length > 0) {
       sections.push(
         '',
-        '验证',
+        '✅ 验证',
         ...detail.verification.slice(0, 3).map((item) => `- ${truncateMessage(item, 90)}`)
       );
     }
@@ -802,7 +879,7 @@ export class TelegramBotIntegration extends EventEmitter {
   } | null {
     if (typeof result === 'string') {
       return {
-        summary: result,
+        summary: autoFormatGeneratedText(result),
         changedFiles: [],
         verification: [],
       };
@@ -824,7 +901,7 @@ export class TelegramBotIntegration extends EventEmitter {
       verification?: unknown;
     };
     const summary = typeof workspaceResult.summary === 'string'
-      ? workspaceResult.summary
+      ? autoFormatGeneratedText(workspaceResult.summary)
       : '已完成本地工作区执行。';
     const changedFiles = Array.isArray(workspaceResult.changedFiles)
       ? (workspaceResult.changedFiles.filter(
@@ -845,52 +922,71 @@ export class TelegramBotIntegration extends EventEmitter {
   }
 
   private buildExpandedSummaryContents(summary: unknown): string[] {
-    if (
-      typeof summary !== 'object' ||
-      summary === null ||
-      !('results' in summary) ||
-      !Array.isArray((summary as { results?: unknown }).results)
-    ) {
+    const summaryRecord = this.normalizeIntegratedSummary(summary);
+    if (!summaryRecord) {
       return [];
     }
 
-    const results = (summary as { results: unknown[] }).results;
-
-    return results.flatMap((item: unknown, index) => {
-      if (typeof item !== 'object' || item === null) {
-        return [];
-      }
-
-      const description =
-        typeof (item as { description?: unknown }).description === 'string'
-          ? (item as { description: string }).description
-          : `子任务 ${index + 1}`;
-      const detail = this.extractTaskResultDetail((item as { result?: unknown }).result);
+    const expandedResults = summaryRecord.results.flatMap((item, index) => {
+      const detail = this.extractTaskResultDetail(item.result);
 
       if (!detail || !this.shouldSendExpandedResult(detail.summary)) {
         return [];
       }
 
       const sections = [
-        `任务 ${index + 1} 完整结果`,
+        `📖 任务 ${index + 1} 完整结果`,
         '',
-        '任务',
-        `- ${description}`,
+        '📝 任务',
+        `- ${item.description}`,
         '',
-        '结果全文',
+        '🧾 结果全文',
         detail.summary,
       ];
 
       if (detail.changedFiles.length > 0) {
-        sections.push('', '修改文件', ...detail.changedFiles.map((file) => `- ${file}`));
+        sections.push('', '🛠️ 修改文件', ...detail.changedFiles.map((file) => `- ${file}`));
       }
 
       if (detail.verification.length > 0) {
-        sections.push('', '验证', ...detail.verification.map((itemText) => `- ${itemText}`));
+        sections.push('', '✅ 验证', ...detail.verification.map((itemText) => `- ${itemText}`));
       }
 
       return [sections.join('\n')];
     });
+
+    const expandedFailures = summaryRecord.failures.flatMap((item, index) => {
+      const detail = this.extractTaskResultDetail(item.result);
+
+      if (!detail || !this.shouldSendExpandedResult(detail.summary)) {
+        return [];
+      }
+
+      const sections = [
+        `⚠️ 失败任务 ${index + 1} 详情`,
+        '',
+        '📝 任务',
+        `- ${item.description}`,
+        '',
+        '❗ 错误',
+        `- ${item.error}`,
+        '',
+        '🧾 结果全文',
+        detail.summary,
+      ];
+
+      if (detail.changedFiles.length > 0) {
+        sections.push('', '🛠️ 修改文件', ...detail.changedFiles.map((file) => `- ${file}`));
+      }
+
+      if (detail.verification.length > 0) {
+        sections.push('', '✅ 验证', ...detail.verification.map((itemText) => `- ${itemText}`));
+      }
+
+      return [sections.join('\n')];
+    });
+
+    return [...expandedResults, ...expandedFailures];
   }
 
   private appendConversationTurn(chatId: string, turn: ConversationTurn): void {
@@ -1040,7 +1136,7 @@ export class TelegramBotIntegration extends EventEmitter {
         '当前聊天任务',
         `- ${truncateMessage(activeExecution.description, 80)}`,
         `- 任务 ID: ${activeExecution.taskId}`,
-        `- 状态: ${activeExecution.cancelRequested ? '取消中' : '执行中'}`
+        `- 状态: ${activeExecution.cancelRequested ? '中断中' : '执行中'}`
       );
     }
 
@@ -1131,11 +1227,12 @@ export class TelegramBotIntegration extends EventEmitter {
       type: 'question',
       from: 'orchestrator',
       content: [
-        `已收到取消请求: ${executionState.taskId}`,
+        `已收到中断请求: ${executionState.taskId}`,
         '',
         `- 已取消待执行任务: ${cancelled.cancelledPendingCount}`,
-        `- 仍在执行中的任务: ${cancelled.runningCount}`,
-        '- 说明: 正在运行的那一批不会强杀，但不会再继续调度新的任务。',
+        `- 运行中任务总数: ${cancelled.runningCount}`,
+        `- 已发送中断信号: ${cancelled.interruptedRunningCount}`,
+        '- 说明: 正在运行的小弟会尽快在当前可中断点停下，系统不会再继续调度新的任务。',
       ].join('\n'),
     });
   }
@@ -1269,7 +1366,7 @@ export class TelegramBotIntegration extends EventEmitter {
         '当前聊天任务',
         `- ${truncateMessage(activeExecution.description, 80)}`,
         `- 任务 ID: ${activeExecution.taskId}`,
-        `- 状态: ${activeExecution.cancelRequested ? '取消中' : '执行中'}`
+        `- 状态: ${activeExecution.cancelRequested ? '中断中' : '执行中'}`
       );
     }
 
@@ -1402,6 +1499,41 @@ export class TelegramBotIntegration extends EventEmitter {
     return this.chatWorkspaceRoots.get(chatId) || this.config.defaultWorkspaceRoot;
   }
 
+  private async handleDirectConversation(
+    chatId: string,
+    userInput: string,
+    msg: TelegramBot.Message
+  ): Promise<boolean> {
+    const reply = buildDirectConversationReply(userInput);
+    if (!reply) {
+      return false;
+    }
+
+    this.appendLifecycleLog(chatId, 'user', userInput);
+    this.appendConversationTurn(chatId, {
+      role: 'user',
+      sender: this.getSenderName(msg),
+      content: userInput,
+      timestamp: this.getMessageTimestamp(msg),
+    });
+
+    this.appendLifecycleLog(chatId, 'assistant', reply);
+    this.appendConversationTurn(chatId, {
+      role: 'assistant',
+      sender: 'orchestrator',
+      content: reply,
+      timestamp: new Date().toISOString(),
+    });
+
+    await this.sendMessage(chatId, {
+      type: 'question',
+      from: 'orchestrator',
+      content: reply,
+    });
+
+    return true;
+  }
+
   private async submitUserTask(
     chatId: string,
     userInput: string,
@@ -1451,10 +1583,12 @@ export class TelegramBotIntegration extends EventEmitter {
         content: this.formatTaskAcceptedContent(task.id, normalizedInput, workspaceRoot),
       });
 
-      await this.sendWorkflowStageUpdate(chatId, '分析中', [
-        '正在评估任务难度和拆分方式',
-        workspaceRoot ? `项目目录: ${workspaceRoot}` : '项目目录: 未绑定，使用默认工作区',
-      ]);
+      if (this.shouldEmitIntermediateExecutionUpdates()) {
+        await this.sendWorkflowStageUpdate(chatId, '分析中', [
+          '正在评估任务难度和拆分方式',
+          workspaceRoot ? `项目目录: ${workspaceRoot}` : '项目目录: 未绑定，使用默认工作区',
+        ]);
+      }
 
       void this.processUserRequest(chatId, task);
     } catch (error) {
@@ -1472,16 +1606,17 @@ export class TelegramBotIntegration extends EventEmitter {
     workspaceRoot: string | undefined
   ): string {
     return [
-      `任务已接收: ${taskId}`,
+      `📥 任务已接收: ${taskId}`,
       '',
-      '需求',
+      '📝 需求',
       `- ${truncateMessage(userInput, 120)}`,
       '',
-      '项目目录',
+      '📁 项目目录',
       workspaceRoot || '未绑定，使用默认工作区',
       '',
-      '下一步',
-      '- 开始分析任务并安排小弟执行',
+      '⏳ 状态',
+      '- 已转为后台静默运行，过程消息默认省略',
+      '- 如需实时打断，发送 /cancel',
     ].join('\n');
   }
 
@@ -1506,6 +1641,7 @@ export class TelegramBotIntegration extends EventEmitter {
       rootTaskFound: boolean;
       cancelledPendingCount: number;
       runningCount: number;
+      interruptedRunningCount: number;
     }
   ): Promise<void> {
     const content = cancelled.rootTaskFound
@@ -1513,8 +1649,9 @@ export class TelegramBotIntegration extends EventEmitter {
           `任务 ${taskId} 已停止继续调度`,
           '',
           `- 已取消待执行任务: ${cancelled.cancelledPendingCount}`,
-          `- 当时仍在执行中的任务: ${cancelled.runningCount}`,
-          '- 说明: 已开始执行的任务可能会自然结束，但系统不会再继续安排新的子任务。',
+          `- 运行中任务总数: ${cancelled.runningCount}`,
+          `- 已发送中断信号: ${cancelled.interruptedRunningCount}`,
+          '- 说明: 收到中断信号的小弟会尽快在当前可中断点停止，系统也不会再继续安排新的子任务。',
         ].join('\n')
       : `任务 ${taskId} 未找到，可能已经结束。`;
 
@@ -1844,6 +1981,100 @@ export class TelegramBotIntegration extends EventEmitter {
     }
   }
 
+  private resolveTaskChatId(task: { context: Record<string, unknown> } | null | undefined): string | undefined {
+    const contextChatId = task?.context?.chatId;
+    if (typeof contextChatId === 'string' && contextChatId.trim().length > 0) {
+      return contextChatId.trim();
+    }
+
+    return this.config.chatId;
+  }
+
+  private resolveProgressChatId(event: WorkerProgressEvent): string | undefined {
+    if (typeof event.chatId === 'string' && event.chatId.trim().length > 0) {
+      return event.chatId.trim();
+    }
+
+    return this.config.chatId;
+  }
+
+  private attachWorkerEventListeners(worker: Worker): void {
+    if (this.attachedWorkerListeners.has(worker.id)) {
+      return;
+    }
+
+    this.attachedWorkerListeners.add(worker.id);
+
+    worker.on('progress', async (event) => {
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
+      }
+
+      const chatId = this.resolveProgressChatId(event);
+      if (
+        chatId &&
+        event.progress >= 0 &&
+        !(event.progress >= 100 && event.message === '任务完成') &&
+        this.shouldSendWorkerProgress(chatId, worker.id, event.progress, event.message)
+      ) {
+        await this.sendProgressUpdate(
+          chatId,
+          worker.id,
+          event.progress,
+          event.message
+        );
+      }
+    });
+
+    worker.on('task-completed', async (task) => {
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
+      }
+
+      const chatId = this.resolveTaskChatId(task);
+      if (chatId) {
+        this.clearWorkerProgress(chatId, worker.id);
+        await this.sendTaskCompletionMessages(chatId, worker.id, task);
+      }
+    });
+
+    worker.on('task-cancelled', async (task, error) => {
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
+      }
+
+      const chatId = this.resolveTaskChatId(task);
+      if (chatId) {
+        this.clearWorkerProgress(chatId, worker.id);
+        await this.sendMessage(chatId, {
+          type: 'question',
+          from: worker.id,
+          content: `任务已中断: ${task.description}\n\n原因: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    });
+
+    worker.on('task-failed', async (task, error) => {
+      if (!this.shouldEmitIntermediateExecutionUpdates()) {
+        return;
+      }
+
+      const chatId = this.resolveTaskChatId(task);
+      if (chatId) {
+        this.clearWorkerProgress(chatId, worker.id);
+        await this.sendMessage(chatId, {
+          type: 'error_report',
+          from: worker.id,
+          content: `❌ 任务失败: ${task.description}\n\n错误: ${error}`,
+        });
+      }
+    });
+  }
+
+  private shouldEmitIntermediateExecutionUpdates(): boolean {
+    return this.config.executionUpdatesMode === 'verbose';
+  }
+
   private formatCommandHelp(): string {
     return [
       '可用命令',
@@ -1867,7 +2098,7 @@ export class TelegramBotIntegration extends EventEmitter {
       '- 查看最近任务日志',
       '',
       '/cancel',
-      '- 取消当前聊天任务（软取消）',
+      '- 实时中断当前聊天任务',
       '',
       '/status',
       '- 查看当前项目目录、上下文轮数和小弟运行状态',
@@ -1888,17 +2119,13 @@ export class TelegramBotIntegration extends EventEmitter {
     message: string;
     cause?: string;
   }): string | undefined {
-    const combined = `${details.code || ''} ${details.message} ${details.cause || ''}`.toLowerCase();
+    const combined = buildTelegramErrorFingerprint(details);
 
     if (combined.includes('409 conflict') || combined.includes('terminated by other getupdates request')) {
       return '同一个 Telegram Bot Token 同时只能有一个 polling 实例在运行，请关闭其他进程后再重试。';
     }
 
-    if (
-      combined.includes('tls connection') ||
-      combined.includes('socket disconnected') ||
-      combined.includes('aggregateerror')
-    ) {
+    if (isRetryableTelegramNetworkFailure(details)) {
       return 'Telegram 连接被网络或代理中断了，优先检查 TELEGRAM_PROXY_URL、代理软件状态和当前网络，再等待自动重试。';
     }
 
@@ -1926,7 +2153,7 @@ export class TelegramBotIntegration extends EventEmitter {
   }
 
   private async safeBotSendMessage(chatId: string, text: string): Promise<boolean> {
-    const maxAttempts = 3;
+    const maxAttempts = 5;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
@@ -1948,9 +2175,9 @@ export class TelegramBotIntegration extends EventEmitter {
         console.error('telegram sendMessage retry', {
           ...details,
           attempt,
-          nextRetryInMs: attempt * 1000,
+          nextRetryInMs: getTelegramRetryDelayMs(attempt),
         });
-        await delay(attempt * 1000);
+        await delay(getTelegramRetryDelayMs(attempt));
       }
     }
 
@@ -1986,19 +2213,434 @@ export class TelegramBotIntegration extends EventEmitter {
       cause?: string;
     }
   ): boolean {
-    const fallback = details || this.describeError(error);
-    const combined = `${fallback.code || ''} ${fallback.message} ${fallback.cause || ''}`.toLowerCase();
-
-    return (
-      combined.includes('efatal') ||
-      combined.includes('econnreset') ||
-      combined.includes('socket disconnected') ||
-      combined.includes('tls connection') ||
-      combined.includes('etimedout') ||
-      combined.includes('esockettimedout') ||
-      combined.includes('eai_again')
-    );
+    return isRetryableTelegramNetworkFailure(details || this.describeError(error));
   }
+}
+
+function buildDirectConversationReply(input: string): string | null {
+  const normalized = normalizeConversationInput(input);
+
+  if (isGreetingMessage(normalized)) {
+    return '你好，我在。直接发开发任务给我，或用 /help 查看命令。';
+  }
+
+  if (isThanksMessage(normalized)) {
+    return '不客气，继续发任务就行。';
+  }
+
+  if (isAcknowledgementMessage(normalized)) {
+    return '好，随时把任务发给我。';
+  }
+
+  return null;
+}
+
+function normalizeSummaryCount(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, Math.floor(parsed));
+    }
+  }
+
+  return Math.max(0, fallback);
+}
+
+function deduplicateStrings(items: string[]): string[] {
+  const unique: string[] = [];
+
+  for (const item of items) {
+    if (!item || unique.includes(item)) {
+      continue;
+    }
+    unique.push(item);
+  }
+
+  return unique;
+}
+
+function normalizeFinalOpinionBlock(content: string): string {
+  const lines = content
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return '📌 结论\n- 任务已处理完成。';
+  }
+
+  const sections: string[] = [];
+  let hasHeading = false;
+
+  for (const line of lines) {
+    if (/^(📌|📎|💡|⚠️)\s*/u.test(line)) {
+      if (sections.length > 0 && sections[sections.length - 1] !== '') {
+        sections.push('');
+      }
+      sections.push(line.replace(/[:：]\s*$/u, ''));
+      hasHeading = true;
+      continue;
+    }
+
+    const cleaned = line
+      .replace(/^[-*+•]\s*/u, '')
+      .replace(/^\d+[.)、]\s*/u, '')
+      .trim();
+
+    if (!hasHeading) {
+      sections.push('📌 结论');
+      hasHeading = true;
+    }
+
+    sections.push(`- ${ensureSentenceEnding(stripOpinionPrefix(cleaned))}`);
+  }
+
+  return sections.join('\n');
+}
+
+function collapseWhitespace(content: string): string {
+  return content.replace(/\s+/g, ' ').trim();
+}
+
+function stripOpinionPrefix(content: string): string {
+  return content
+    .replace(/^(🎯\s*)?最终意见[:：]\s*/u, '')
+    .replace(/^(📌\s*)?(总结|结论|建议)[:：]\s*/u, '')
+    .trim();
+}
+
+function trimTrailingPunctuation(content: string): string {
+  return content.replace(/[。！？；;，,\s]+$/g, '').trim();
+}
+
+function ensureSentenceEnding(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  return /[。！？!?]$/.test(trimmed) ? trimmed : `${trimmed}。`;
+}
+
+function joinAsChineseSeries(items: string[]): string {
+  if (items.length === 0) {
+    return '';
+  }
+
+  if (items.length === 1) {
+    return items[0] || '';
+  }
+
+  if (items.length === 2) {
+    return `${items[0]}，以及${items[1]}`;
+  }
+
+  return `${items.slice(0, -1).join('，')}，以及${items[items.length - 1]}`;
+}
+
+function autoFormatGeneratedText(content: string): string {
+  const normalized = content.replace(/\r/g, '').trim();
+  if (!normalized) {
+    return normalized;
+  }
+
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return normalized;
+  }
+
+  const title = shouldPreserveAsTitle(lines) ? lines[0] || '' : '';
+  const bodyLines = title ? lines.slice(1) : lines;
+  const body = bodyLines.join('\n').trim();
+
+  if (!body) {
+    return title || normalized;
+  }
+
+  const formattedBody = looksStructuredText(body)
+    ? normalizeStructuredText(body)
+    : formatProseText(body);
+
+  if (!title) {
+    return formattedBody;
+  }
+
+  return `${title}\n\n${formattedBody}`.trim();
+}
+
+function shouldPreserveAsTitle(lines: string[]): boolean {
+  if (lines.length < 2) {
+    return false;
+  }
+
+  const firstLine = lines[0] || '';
+  const secondLine = lines[1] || '';
+
+  return (
+    firstLine.length > 0 &&
+    firstLine.length <= 24 &&
+    !/[。！？!?；;:：]/.test(firstLine) &&
+    secondLine.length >= 20
+  );
+}
+
+function looksStructuredText(content: string): boolean {
+  if (content.includes('```')) {
+    return true;
+  }
+
+  const lines = content
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const structuredLineCount = lines.filter((line) => (
+    /^#{1,6}\s/.test(line) ||
+    /^[-*+]\s/.test(line) ||
+    /^\d+[.)、]\s/.test(line) ||
+    /^>\s/.test(line) ||
+    /^\|.*\|$/.test(line)
+  )).length;
+
+  if (structuredLineCount >= 2) {
+    return true;
+  }
+
+  const shortLineCount = lines.filter((line) => line.length <= 20).length;
+  return lines.length >= 4 && shortLineCount >= Math.ceil(lines.length * 0.6);
+}
+
+function normalizeStructuredText(content: string): string {
+  if (content.includes('```')) {
+    return content
+      .split(/\n{2,}/)
+      .map((block) => block
+        .split('\n')
+        .map((line) => line.trimEnd())
+        .join('\n')
+        .trim())
+      .filter(Boolean)
+      .join('\n\n');
+  }
+
+  const lines = content.replace(/\r/g, '').split('\n');
+  const trimmedLines = lines.map((line) => line.trim()).filter(Boolean);
+  const hasHeading = trimmedLines.some((line) => isStructuredHeadingLine(line));
+  const normalizedLines: string[] = [];
+  let overviewDecorated = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (normalizedLines.length > 0 && normalizedLines[normalizedLines.length - 1] !== '') {
+        normalizedLines.push('');
+      }
+      continue;
+    }
+
+    if (isStructuredHeadingLine(line)) {
+      if (normalizedLines.length > 0 && normalizedLines[normalizedLines.length - 1] !== '') {
+        normalizedLines.push('');
+      }
+      normalizedLines.push(formatStructuredHeadingLine(line));
+      continue;
+    }
+
+    if (!overviewDecorated && hasHeading && !isStructuredBulletLine(line)) {
+      normalizedLines.push(`📌 ${line}`);
+      overviewDecorated = true;
+      continue;
+    }
+
+    if (isStructuredBulletLine(line)) {
+      normalizedLines.push(formatStructuredBulletLine(line));
+      continue;
+    }
+
+    normalizedLines.push(line);
+  }
+
+  return normalizedLines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function formatProseText(content: string): string {
+  const compact = content
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+([，。！？；：、])/g, '$1')
+    .replace(/([“‘（【《])\s+/g, '$1')
+    .replace(/\s+([”’）】》])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+
+  if (compact.length <= 120) {
+    return compact;
+  }
+
+  const sentences = splitIntoSentences(compact);
+  if (sentences.length <= 1) {
+    return wrapParagraphByLength(compact, 120).join('\n\n');
+  }
+
+  const paragraphs: string[] = [];
+  let current = '';
+  let sentenceCount = 0;
+
+  for (const sentence of sentences) {
+    const piece = sentence.trim();
+    if (!piece) {
+      continue;
+    }
+
+    current += piece;
+    sentenceCount += 1;
+
+    if (current.length >= 120 || sentenceCount >= 3) {
+      paragraphs.push(current.trim());
+      current = '';
+      sentenceCount = 0;
+    }
+  }
+
+  if (current) {
+    paragraphs.push(current.trim());
+  }
+
+  return paragraphs.join('\n\n');
+}
+
+function splitIntoSentences(content: string): string[] {
+  const matches = content.match(/[^。！？!?；;]+[。！？!?；;”’"]*|[^。！？!?；;]+$/g);
+  return matches?.map((item) => item.trim()).filter(Boolean) || [content];
+}
+
+function wrapParagraphByLength(content: string, maxLength: number): string[] {
+  const paragraphs: string[] = [];
+  let remaining = content.trim();
+
+  while (remaining.length > maxLength) {
+    paragraphs.push(remaining.slice(0, maxLength).trim());
+    remaining = remaining.slice(maxLength).trim();
+  }
+
+  if (remaining) {
+    paragraphs.push(remaining);
+  }
+
+  return paragraphs;
+}
+
+function isStructuredHeadingLine(line: string): boolean {
+  return (
+    /^#{1,6}\s*/.test(line) ||
+    /^\d+[.)、]\s*/.test(line) ||
+    /^[一二三四五六七八九十]+[、.．]\s*/.test(line)
+  );
+}
+
+function isStructuredBulletLine(line: string): boolean {
+  return /^[-*+•]\s*/.test(line);
+}
+
+function formatStructuredHeadingLine(line: string): string {
+  const cleaned = line
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^(\d+)[)）、.．]\s*/, '$1. ')
+    .replace(/^([一二三四五六七八九十]+)[、.．]\s*/, '$1、')
+    .trim();
+
+  return `${pickHeadingEmoji(cleaned)} ${cleaned}`;
+}
+
+function formatStructuredBulletLine(line: string): string {
+  const cleaned = line.replace(/^[-*+•]\s*/, '').trim();
+  return `• ${cleaned}`;
+}
+
+function pickHeadingEmoji(text: string): string {
+  const normalized = text.toLowerCase();
+
+  if (/(架构|设计|结构|分层)/.test(normalized)) {
+    return '🏗️';
+  }
+
+  if (/(功能|边界|模块|能力)/.test(normalized)) {
+    return '⚙️';
+  }
+
+  if (/(流程|步骤|执行|运行|链路)/.test(normalized)) {
+    return '🔄';
+  }
+
+  if (/(结果|结论|总结|概览|概括)/.test(normalized)) {
+    return '📌';
+  }
+
+  if (/(风险|问题|异常|告警|失败)/.test(normalized)) {
+    return '⚠️';
+  }
+
+  if (/(建议|优化|改进)/.test(normalized)) {
+    return '💡';
+  }
+
+  if (/(测试|验证|检查)/.test(normalized)) {
+    return '✅';
+  }
+
+  if (/(文件|目录|项目|资源)/.test(normalized)) {
+    return '📁';
+  }
+
+  return '📍';
+}
+
+function getTelegramRetryDelayMs(attempt: number): number {
+  return Math.min(8000, 1000 * 2 ** Math.max(0, attempt - 1));
+}
+
+function buildTelegramErrorFingerprint(details: {
+  code?: string;
+  message: string;
+  cause?: string;
+}): string {
+  return `${details.code || ''} ${details.message} ${details.cause || ''}`.toLowerCase();
+}
+
+function isRetryableTelegramNetworkFailure(details: {
+  code?: string;
+  message: string;
+  cause?: string;
+}): boolean {
+  const combined = buildTelegramErrorFingerprint(details);
+
+  return (
+    combined.includes('efatal') ||
+    combined.includes('econnreset') ||
+    combined.includes('socket disconnected') ||
+    combined.includes('tls connection') ||
+    combined.includes('etimedout') ||
+    combined.includes('esockettimedout') ||
+    combined.includes('eai_again') ||
+    combined.includes('und_err_socket') ||
+    combined.includes('other side closed') ||
+    combined.includes('socket hang up') ||
+    combined.includes('aggregateerror')
+  );
 }
 
 function truncateMessage(content: string, maxLength: number): string {
@@ -2011,6 +2653,39 @@ function truncateMessage(content: string, maxLength: number): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeConversationInput(content: string): string {
+  return content
+    .trim()
+    .toLowerCase()
+    .replace(/[!！?？~～,，。.\s]+/g, '');
+}
+
+function isGreetingMessage(content: string): boolean {
+  return [
+    '你好',
+    '您好',
+    'hi',
+    'hello',
+    'hey',
+    '哈喽',
+    '嗨',
+    '在吗',
+    '在不',
+    '早上好',
+    '中午好',
+    '下午好',
+    '晚上好',
+  ].includes(content);
+}
+
+function isThanksMessage(content: string): boolean {
+  return ['谢谢', '谢谢你', '感谢', '多谢', '谢了', 'thanks', 'thx'].includes(content);
+}
+
+function isAcknowledgementMessage(content: string): boolean {
+  return ['好的', '好', '收到', '明白', 'ok', 'okay', '再见', '拜拜'].includes(content);
 }
 
 const TELEGRAM_MESSAGE_CONTENT_LIMIT = 3200;
@@ -2049,13 +2724,6 @@ function splitTelegramMessageContent(content: string, maxLength: number): string
   }
 
   return chunks.filter(Boolean);
-}
-
-function indentBlock(content: string, prefix: string): string {
-  return content
-    .split('\n')
-    .map((line) => `${prefix}${line}`)
-    .join('\n');
 }
 
 function extractHighlights(content: string, maxItems: number): string[] {
