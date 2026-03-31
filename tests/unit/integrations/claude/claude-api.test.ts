@@ -103,8 +103,8 @@ describe('RetryStrategy', () => {
 
     const operation = vi
       .fn()
-      .mockRejectedValueOnce(new Error('Fail 1'))
-      .mockRejectedValueOnce(new Error('Fail 2'))
+      .mockRejectedValueOnce(new Error('429 rate limit'))
+      .mockRejectedValueOnce(new Error('500 server error'))
       .mockResolvedValue('success');
 
     const result = await strategy.execute(operation, isRetryableError);
@@ -119,7 +119,7 @@ describe('RetryStrategy', () => {
       initialDelay: 10,
     });
 
-    const operation = vi.fn().mockRejectedValue(new Error('Always fail'));
+    const operation = vi.fn().mockRejectedValue(new Error('429 rate limit'));
 
     await expect(strategy.execute(operation, isRetryableError)).rejects.toThrow(
       'Operation failed after 2 retries'

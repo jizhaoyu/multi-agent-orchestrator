@@ -24,6 +24,38 @@ export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
 export type TaskPriority = 'high' | 'medium' | 'low';
 
 /**
+ * 任务难度
+ */
+export type TaskDifficulty = 'simple' | 'medium' | 'complex';
+
+/**
+ * 对话上下文
+ */
+export interface ConversationTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  sender?: string;
+  timestamp?: string;
+}
+
+/**
+ * 任务执行计划
+ */
+export interface TaskExecutionPlan {
+  difficulty: TaskDifficulty;
+  recommendedWorkers: number;
+  rationale: string;
+}
+
+/**
+ * 任务分配配置
+ */
+export interface TaskAssignmentOptions {
+  maxConcurrentWorkers?: number;
+  shouldContinue?: () => boolean;
+}
+
+/**
  * Agent 接口
  */
 export interface IAgent {
@@ -112,13 +144,13 @@ export interface ITask {
  */
 export interface IOrchestrator {
   /** 接收用户任务 */
-  receiveTask(userInput: string): Promise<ITask>;
+  receiveTask(userInput: string, context?: Record<string, unknown>): Promise<ITask>;
 
   /** 任务分解 */
   decomposeTask(task: ITask): Promise<ITask[]>;
 
   /** 任务分配 */
-  assignTasks(tasks: ITask[]): Promise<void>;
+  assignTasks(tasks: ITask[], options?: TaskAssignmentOptions): Promise<void>;
 
   /** 监控进度 */
   monitorProgress(): Promise<void>;

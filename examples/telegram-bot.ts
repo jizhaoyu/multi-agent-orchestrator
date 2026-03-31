@@ -6,14 +6,15 @@
 import {
   Orchestrator,
   Worker,
-  ClaudeAPIClient,
   StateManager,
   TaskManager,
   MemoryService,
+  createAPIClientFromEnv,
 } from '../src';
 import { TelegramBotIntegration } from '../src/integrations/telegram';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as dotenv from 'dotenv';
 
 // 加载环境变量
@@ -21,12 +22,6 @@ dotenv.config();
 
 async function main() {
   console.log('🤖 Multi-Agent Orchestrator + Telegram Bot 示例\n');
-
-  // 检查必要的环境变量
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('❌ 错误: 请设置 ANTHROPIC_API_KEY 环境变量');
-    process.exit(1);
-  }
 
   if (!process.env.TELEGRAM_BOT_TOKEN) {
     console.error('❌ 错误: 请设置 TELEGRAM_BOT_TOKEN 环境变量');
@@ -42,11 +37,8 @@ async function main() {
   // 2. 初始化核心服务
   console.log('📦 初始化核心服务...');
 
-  const apiClient = new ClaudeAPIClient({
-    apiKey: process.env.ANTHROPIC_API_KEY,
-    model: 'claude-opus-4-5',
-    maxTokens: 200000,
-  });
+  const apiClient = createAPIClientFromEnv();
+  console.log(`🤖 当前 AI Provider: ${process.env.AI_PROVIDER || 'codex'}`);
 
   const stateManager = new StateManager({
     dbPath: path.join(dataDir, 'state.db'),
@@ -57,7 +49,7 @@ async function main() {
   });
 
   const memoryService = new MemoryService({
-    configRoot: process.env.CONFIG_ROOT || path.join(process.env.HOME || '~', '.claude'),
+    configRoot: resolveConfigRoot(),
     enableWatch: false,
   });
 
@@ -65,6 +57,7 @@ async function main() {
   console.log('👷 创建 9 个 Workers...');
 
   const workers: Worker[] = [];
+  const workspaceRoot = resolveWorkspaceRoot();
   for (let i = 1; i <= 9; i++) {
     const worker = new Worker({
       id: `worker-${i}`,
@@ -72,6 +65,10 @@ async function main() {
       stateManager,
       taskManager,
       memoryService,
+      workspaceRoot,
+      enableWorkspaceExecution: process.env.ENABLE_WORKSPACE_EXECUTION !== 'false',
+      maxExecutionIterations: readNumber(process.env.MAX_EXECUTION_ITERATIONS) || 6,
+      commandTimeoutMs: readNumber(process.env.COMMAND_TIMEOUT_MS) || 120000,
     });
     workers.push(worker);
   }
@@ -93,6 +90,13 @@ async function main() {
 
   const telegramBot = new TelegramBotIntegration({
     token: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+    defaultWorkspaceRoot: workspaceRoot,
+    projectSearchRoots: resolveProjectSearchRoots(workspaceRoot),
+    proxyUrl:
+      process.env.TELEGRAM_PROXY_URL ||
+      process.env.HTTPS_PROXY ||
+      process.env.HTTP_PROXY,
     orchestrator,
     workers,
   });
@@ -149,3 +153,33 @@ main().catch((error) => {
   console.error('❌ 错误:', error);
   process.exit(1);
 });
+
+function resolveConfigRoot(): string {
+  return process.env.CONFIG_ROOT || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+function resolveWorkspaceRoot(): string {
+  return process.env.WORKSPACE_ROOT || path.join(__dirname, '..');
+}
+
+function resolveProjectSearchRoots(workspaceRoot: string): string[] {
+  const configuredRoots = process.env.PROJECT_SEARCH_ROOTS;
+  if (!configuredRoots) {
+    return [path.dirname(workspaceRoot)];
+  }
+
+  return configuredRoots
+    .split(/[;,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => path.resolve(item));
+}
+
+function readNumber(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}

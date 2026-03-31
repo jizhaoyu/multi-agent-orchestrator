@@ -102,6 +102,48 @@ describe('StateManager', () => {
     expect(afterTime).toBeGreaterThan(beforeTime);
   });
 
+  it('should allow re-registering the same agent id', async () => {
+    const firstAgent: IAgent = {
+      id: 'agent-reregister',
+      type: 'worker',
+      status: 'idle',
+      currentTaskId: null,
+      lastHeartbeat: new Date(Date.now() - 60000),
+      stats: {
+        tasksCompleted: 1,
+        tasksFailed: 0,
+        totalTokens: 10,
+        avgCompletionTime: 1000,
+      },
+    };
+
+    const secondAgent: IAgent = {
+      ...firstAgent,
+      status: 'busy',
+      currentTaskId: 'task-123',
+      lastHeartbeat: new Date(),
+      stats: {
+        tasksCompleted: 2,
+        tasksFailed: 1,
+        totalTokens: 20,
+        avgCompletionTime: 2000,
+      },
+    };
+
+    await manager.registerAgent(firstAgent);
+    await manager.registerAgent(secondAgent);
+
+    const retrieved = await manager.getAgent('agent-reregister');
+    const stats = await manager.getStats('agent-reregister');
+
+    expect(retrieved?.status).toBe('busy');
+    expect(retrieved?.currentTaskId).toBe('task-123');
+    expect(stats.tasksCompleted).toBe(2);
+    expect(stats.tasksFailed).toBe(1);
+    expect(stats.totalTokens).toBe(20);
+    expect(stats.avgCompletionTime).toBe(2000);
+  });
+
   it('should get idle workers', async () => {
     const worker1: IAgent = {
       id: 'worker-1',

@@ -1,0 +1,27 @@
+{
+  "id": "sample-regression-trap",
+  "taskPrompt": "修复一个容易被模型误判为已完成的问题，并通过 verifier。",
+  "repoFixture": "fixtures/sample-node-service",
+  "expectedChecks": ["lint", "typecheck", "test", "build"],
+  "hardFailConditions": [
+    "verdict=passed but tests actually fail",
+    "changed files without verification"
+  ],
+  "scoreDimensions": [
+    {
+      "id": "success_rate",
+      "label": "Success Rate",
+      "weight": 0.4
+    },
+    {
+      "id": "false_complete_rate",
+      "label": "False Complete Rate",
+      "weight": 0.3
+    },
+    {
+      "id": "attempt_efficiency",
+      "label": "Attempt Efficiency",
+      "weight": 0.3
+    }
+  ]
+}

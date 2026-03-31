@@ -1,0 +1,34 @@
+{
+  "permissionProfile": "dev_safe",
+  "verificationPolicy": {
+    "name": "default-node-policy",
+    "commands": [
+      {
+        "id": "lint",
+        "label": "Lint",
+        "command": "npm run lint",
+        "kind": "lint"
+      },
+      {
+        "id": "typecheck",
+        "label": "Typecheck",
+        "command": "npm run typecheck",
+        "kind": "typecheck"
+      },
+      {
+        "id": "unit",
+        "label": "Unit tests",
+        "command": "npm test",
+        "kind": "unit"
+      },
+      {
+        "id": "build",
+        "label": "Build",
+        "command": "npm run build",
+        "kind": "build"
+      }
+    ],
+    "requireVerificationWhenFilesChange": true,
+    "allowPassWithoutChanges": true
+  }
+}

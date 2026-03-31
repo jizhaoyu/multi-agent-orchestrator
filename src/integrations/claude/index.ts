@@ -5,8 +5,8 @@
 export { ClaudeAPIClient } from './api-client';
 export type { ClaudeAPIConfig, ClaudeAPIResponse, StreamCallback } from './api-client';
 
-export { ContextBuilder } from './context-builder';
-export type { Message, MessageRole } from './context-builder';
+export { ContextBuilder } from '@/integrations/llm';
+export type { Message, MessageRole } from '@/integrations/llm';
 
 export { RetryStrategy, withRetry, isRetryableError } from './retry-strategy';
 export type { RetryConfig } from './retry-strategy';

@@ -7,7 +7,6 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { ITaskManager, ITask, TaskStatus, TaskPriority } from '@/types';
-import { v4 as uuidv4 } from 'uuid';
 
 /**
  * 任务管理器配置
@@ -19,15 +18,6 @@ export interface TaskManagerConfig {
   /** 最大任务深度 */
   maxDepth?: number;
 }
-
-/**
- * 优先级映射
- */
-const PRIORITY_VALUE: Record<TaskPriority, number> = {
-  high: 3,
-  medium: 2,
-  low: 1,
-};
 
 /**
  * 任务管理器
@@ -63,8 +53,6 @@ export class TaskManager implements ITaskManager {
         throw new Error(`Circular dependency detected: ${task.id} -> ${task.parentId}`);
       }
     }
-
-    const now = Date.now();
 
     this.db
       .prepare(
@@ -224,6 +212,27 @@ export class TaskManager implements ITaskManager {
       )
       .all() as any[];
 
+    return rows.map((row) => this.rowToTask(row));
+  }
+
+  /**
+   * 获取所有待执行任务
+   */
+  async getPendingTasks(limit?: number): Promise<ITask[]> {
+    const query = `
+      SELECT * FROM tasks
+      WHERE status = 'pending'
+      ORDER BY
+        CASE priority
+          WHEN 'high' THEN 1
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 3
+        END,
+        created_at ASC
+      ${typeof limit === 'number' && limit > 0 ? `LIMIT ${Math.floor(limit)}` : ''}
+    `;
+
+    const rows = this.db.prepare(query).all() as any[];
     return rows.map((row) => this.rowToTask(row));
   }
 

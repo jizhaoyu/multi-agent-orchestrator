@@ -1,22 +1,30 @@
 {
   "name": "multi-agent-orchestrator",
   "version": "0.2.0",
-  "description": "Multi-Agent Orchestrator - 让 Claude Code 大哥指挥多个小弟协同完成任务",
+  "description": "Multi-Agent Orchestrator - 面向 Codex-compatible/Claude 的多 Agent 协同编排器",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.json",
     "dev": "tsc --watch",
-    "test": "vitest",
-    "test:coverage": "vitest --coverage",
-    "lint": "eslint src --ext .ts",
+    "test": "vitest --run",
+    "test:coverage": "vitest --run --coverage",
+    "lint": "eslint . --ext .ts --max-warnings=0",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "format:check": "prettier --check \"{src,tests,examples,docs,scripts}/**/*.{ts,js,mjs,md,json}\"",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build",
     "format": "prettier --write \"src/**/*.ts\"",
-    "example:basic": "ts-node examples/basic-usage.ts",
-    "example:telegram": "ts-node examples/telegram-bot.ts"
+    "harness:init": "node scripts/init-codex-harness.mjs .",
+    "harness:doctor": "node scripts/check-doc-drift.mjs .",
+    "benchmarks": "node scripts/run-benchmarks.mjs benchmarks",
+    "example:basic": "ts-node -r tsconfig-paths/register examples/basic-usage.ts",
+    "example:telegram": "ts-node -r tsconfig-paths/register examples/telegram-bot.ts"
   },
   "keywords": [
     "multi-agent",
     "orchestrator",
+    "codex",
+    "openai-compatible",
     "claude",
     "ai",
     "automation",
@@ -26,5 +34,28 @@
   "license": "MIT",
   "engines": {
     "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
+    "async-lock": "^1.4.1",
+    "better-sqlite3": "^12.4.1",
+    "dotenv": "^17.2.3",
+    "lru-cache": "^11.2.2",
+    "node-telegram-bot-api": "^0.67.0",
+    "tslib": "^2.8.1",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/async-lock": "^1.4.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.6.1",
+    "@types/node-telegram-bot-api": "^0.64.9",
+    "eslint": "^9.37.0",
+    "prettier": "^3.6.2",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript-eslint": "^8.31.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
   }
 }

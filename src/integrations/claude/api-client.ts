@@ -4,7 +4,14 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import type { MessageCreateParams, MessageStream } from '@anthropic-ai/sdk/resources/messages';
+import type { MessageCreateParams } from '@anthropic-ai/sdk/resources/messages';
+import type {
+  LLMClient,
+  LLMMessage,
+  LLMRequestOptions,
+  LLMResponse,
+  StreamCallback,
+} from '@/integrations/llm';
 
 /**
  * API 客户端配置
@@ -29,33 +36,18 @@ export interface ClaudeAPIConfig {
 /**
  * API 响应
  */
-export interface ClaudeAPIResponse {
-  /** 响应内容 */
-  content: string;
+export type ClaudeAPIResponse = LLMResponse;
+export type { StreamCallback } from '@/integrations/llm';
 
-  /** 使用的 Token 数 */
-  tokensUsed: {
-    input: number;
-    output: number;
-    total: number;
-  };
-
-  /** 模型 */
-  model: string;
-
-  /** 停止原因 */
-  stopReason: string | null;
-}
-
-/**
- * 流式响应回调
- */
-export type StreamCallback = (chunk: string) => void;
+type ClaudeRequestOptions = Partial<
+  Omit<MessageCreateParams, 'messages' | 'model' | 'max_tokens' | 'stream'>
+> &
+  LLMRequestOptions;
 
 /**
  * Claude API 客户端
  */
-export class ClaudeAPIClient {
+export class ClaudeAPIClient implements LLMClient<Required<ClaudeAPIConfig>> {
   private client: Anthropic;
   private config: Required<ClaudeAPIConfig>;
 
@@ -79,15 +71,16 @@ export class ClaudeAPIClient {
    * 发送消息（非流式）
    */
   async sendMessage(
-    messages: MessageCreateParams['messages'],
-    options?: Partial<MessageCreateParams>
+    messages: LLMMessage[],
+    options: ClaudeRequestOptions = {}
   ): Promise<ClaudeAPIResponse> {
     try {
+      const { maxOutputTokens, ...restOptions } = options;
       const response = await this.client.messages.create({
         model: this.config.model,
-        max_tokens: this.config.maxTokens,
-        messages,
-        ...options,
+        max_tokens: maxOutputTokens || this.config.maxTokens,
+        messages: this.toAnthropicMessages(messages),
+        ...restOptions,
       });
 
       return {
@@ -109,17 +102,18 @@ export class ClaudeAPIClient {
    * 发送消息（流式）
    */
   async sendMessageStream(
-    messages: MessageCreateParams['messages'],
+    messages: LLMMessage[],
     onChunk: StreamCallback,
-    options?: Partial<MessageCreateParams>
+    options: ClaudeRequestOptions = {}
   ): Promise<ClaudeAPIResponse> {
     try {
+      const { maxOutputTokens, ...restOptions } = options;
       const stream = await this.client.messages.create({
         model: this.config.model,
-        max_tokens: this.config.maxTokens,
-        messages,
+        max_tokens: maxOutputTokens || this.config.maxTokens,
+        messages: this.toAnthropicMessages(messages),
         stream: true,
-        ...options,
+        ...restOptions,
       });
 
       let fullContent = '';
@@ -167,6 +161,16 @@ export class ClaudeAPIClient {
       .filter((block) => block.type === 'text')
       .map((block) => (block as Anthropic.Messages.TextBlock).text)
       .join('');
+  }
+
+  private toAnthropicMessages(messages: LLMMessage[]): MessageCreateParams['messages'] {
+    return messages.map((message) => ({
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      content:
+        message.role === 'user' || message.role === 'assistant'
+          ? message.content
+          : `[${message.role.toUpperCase()}]\n${message.content}`,
+    }));
   }
 
   /**

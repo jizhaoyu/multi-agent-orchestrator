@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Orchestrator } from '@/core/orchestrator';
 import { Worker } from '@/core/worker';
-import { ClaudeAPIClient } from '@/integrations/claude';
+import type { LLMClient, LLMResponse } from '@/integrations/llm';
 import { StateManager } from '@/core/state-manager';
 import { TaskManager } from '@/core/task-manager';
 import { MemoryService } from '@/core/memory-service';
@@ -19,7 +19,7 @@ describe('Orchestrator', () => {
   let stateManager: StateManager;
   let taskManager: TaskManager;
   let memoryService: MemoryService;
-  let apiClient: ClaudeAPIClient;
+  let apiClient: LLMClient;
   let workers: Worker[];
   let dbDir: string;
 
@@ -42,9 +42,7 @@ describe('Orchestrator', () => {
       enableWatch: false,
     });
 
-    apiClient = new ClaudeAPIClient({
-      apiKey: 'test-key',
-    });
+    apiClient = createMockClient();
 
     // 创建 Workers
     workers = [];
@@ -97,6 +95,87 @@ describe('Orchestrator', () => {
     expect(task.status).toBe('pending');
   });
 
+  it('should preserve task context from user conversation', async () => {
+    const task = await orchestrator.receiveTask('继续优化登录流程', {
+      conversationHistory: [
+        {
+          role: 'user',
+          content: '先做登录页',
+        },
+        {
+          role: 'user',
+          content: '再补短信验证码',
+        },
+      ],
+    });
+
+    expect(task.context).toMatchObject({
+      conversationHistory: [
+        {
+          role: 'user',
+          content: '先做登录页',
+        },
+        {
+          role: 'user',
+          content: '再补短信验证码',
+        },
+      ],
+    });
+  });
+
+  it('should analyze difficulty and recommend worker count from conversation context', async () => {
+    vi.mocked(apiClient.sendMessage).mockResolvedValueOnce({
+      content: `任务难度: complex
+推荐小弟数: 3
+分析依据: 涉及前后端和测试，需要多人并行。
+
+子任务 1: 设计接口
+描述: 设计登录接口和验证码校验规则
+优先级: high
+
+子任务 2: 实现前端
+描述: 开发登录页和验证码交互
+优先级: high
+
+子任务 3: 编写测试
+描述: 为登录流程补充接口与页面测试
+优先级: medium`,
+      tokensUsed: {
+        input: 20,
+        output: 40,
+        total: 60,
+      },
+      model: 'mock-model',
+      stopReason: 'stop',
+    });
+
+    const task = await orchestrator.receiveTask('帮我做一个完整的登录系统', {
+      conversationHistory: [
+        {
+          role: 'user',
+          content: '需要账号密码登录',
+        },
+        {
+          role: 'user',
+          content: '还要短信验证码和接口测试',
+        },
+      ],
+    });
+
+    const subtasks = await orchestrator.decomposeTask(task);
+    const prompt = vi.mocked(apiClient.sendMessage).mock.calls.at(-1)?.[0]?.[0]?.content || '';
+
+    expect(prompt).toContain('最近问答');
+    expect(prompt).toContain('短信验证码');
+    expect(subtasks).toHaveLength(3);
+    expect(task.context).toMatchObject({
+      executionPlan: {
+        difficulty: 'complex',
+        recommendedWorkers: 3,
+      },
+    });
+  });
+
   it('should assign tasks to idle workers', async () => {
     const tasks: ITask[] = [
       {
@@ -141,9 +220,47 @@ describe('Orchestrator', () => {
     await orchestrator.assignTasks(tasks);
 
     expect(assignSpy).toHaveBeenCalled();
+    await expect(taskManager.getTask('task-1')).resolves.toMatchObject({
+      status: 'completed',
+      assignedTo: expect.stringMatching(/^worker-\d+$/),
+    });
+    await expect(taskManager.getTask('task-2')).resolves.toMatchObject({
+      status: 'completed',
+      assignedTo: expect.stringMatching(/^worker-\d+$/),
+    });
   });
 
-  it('should emit no-idle-workers when no workers available', async () => {
+  it('should execute tasks in batches when there are more tasks than idle workers', async () => {
+    const tasks: ITask[] = Array.from({ length: 5 }, (_, index) => ({
+      id: `task-${index + 1}`,
+      parentId: null,
+      assignedTo: null,
+      status: 'pending',
+      priority: index === 0 ? 'high' : 'medium',
+      depth: 0,
+      description: `Task ${index + 1}`,
+      context: {},
+      result: null,
+      error: null,
+      createdAt: new Date(),
+      startedAt: null,
+      completedAt: null,
+    }));
+
+    for (const task of tasks) {
+      await taskManager.addTask(task);
+    }
+
+    await orchestrator.assignTasks(tasks);
+
+    for (const task of tasks) {
+      await expect(taskManager.getTask(task.id)).resolves.toMatchObject({
+        status: 'completed',
+      });
+    }
+  });
+
+  it('should create a new worker when no idle workers are available', async () => {
     // 将所有 Worker 设置为 busy
     for (const worker of workers) {
       await stateManager.updateStatus(worker.id, 'busy', 'some-task');
@@ -167,12 +284,14 @@ describe('Orchestrator', () => {
       },
     ];
 
-    const noWorkersSpy = vi.fn();
-    orchestrator.on('no-idle-workers', noWorkersSpy);
-
+    await taskManager.addTask(tasks[0]!);
     await orchestrator.assignTasks(tasks);
 
-    expect(noWorkersSpy).toHaveBeenCalledWith(tasks);
+    expect(orchestrator['config'].workers).toHaveLength(4);
+    await expect(taskManager.getTask('task-1')).resolves.toMatchObject({
+      status: 'completed',
+      assignedTo: 'worker-4',
+    });
   });
 
   it('should review results', async () => {
@@ -281,3 +400,25 @@ describe('Orchestrator', () => {
     expect(stopSpy).toHaveBeenCalled();
   });
 });
+
+function createMockClient(): LLMClient {
+  const response: LLMResponse = {
+    content: 'Mock response',
+    tokensUsed: {
+      input: 10,
+      output: 20,
+      total: 30,
+    },
+    model: 'mock-model',
+    stopReason: 'stop',
+  };
+
+  return {
+    sendMessage: vi.fn().mockResolvedValue(response),
+    sendMessageStream: vi.fn().mockImplementation(async (_messages, onChunk) => {
+      onChunk(response.content);
+      return response;
+    }),
+    getConfig: vi.fn().mockReturnValue({ provider: 'mock' }),
+  };
+}

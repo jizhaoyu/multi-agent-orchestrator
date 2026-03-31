@@ -1,42 +1,66 @@
 # Multi-Agent Orchestrator
 
-让 Claude Code "大哥"指挥多个 Claude Code "小弟"协同完成任务的系统。
+面向 Codex / OpenAI-compatible / Claude 的多 Agent 编排框架。它不只是让模型生成代码，而是把任务拆解、工作区执行、验证闭环、失败沉淀和评估流程整合成一套更可靠的开发 Harness。
 
-## 🎯 项目概述
+## 项目定位
 
-Multi-Agent Orchestrator 是一个多 Agent 协同系统，实现了：
+这个项目可以理解成两层能力的组合：
 
-- **任务分解**：大哥自动将复杂任务分解为可并行的子任务
-- **智能分配**：根据 Worker 状态和任务优先级智能分配任务
-- **实时监控**：监控所有 Worker 的执行进度和心跳状态
-- **错误恢复**：自动检测错误并重新分配任务
-- **动态扩展**：根据需要动态创建新的 Worker
+- 多 Agent 编排层：`Orchestrator` 负责拆任务、分配任务、汇总结果，`Worker` 负责执行、上报进度、处理子任务。
+- Codex Harness 层：把 AI 开发从“生成一次就算完成”升级为“生成 -> 验证 -> 修订”的可靠闭环。
 
-## 🏗️ 系统架构
+当前仓库已经支持：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Orchestrator (大哥)                        │
-│  - 任务分解  - 任务分配  - 进度监控  - 质量把控             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-│  Worker #1   │      │  Worker #2   │ ...  │  Worker #9   │
-│   (小弟)     │      │   (小弟)     │      │   (小弟)     │
-└──────────────┘      └──────────────┘      └──────────────┘
-        │                     │                     │
-        └─────────────────────┴─────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│              共享资源层                                       │
-│  - ~/.claude/ 配置  - 中央记忆服务  - SQLite 数据库         │
-└─────────────────────────────────────────────────────────────┘
-```
+- Codex/OpenAI-compatible 与 Claude 双接入
+- SQLite 持久化任务与 Agent 状态
+- 本地工作区执行器 `WorkspaceExecutor`
+- 命令白名单与权限档位
+- `Generator-Verifier-Reviser` 自动闭环
+- Trace 事件记录与失败知识沉淀
+- Telegram Bot 作为控制面
+- Starter 模板、runbook、benchmark 入口，便于未来项目复用
 
-## 🚀 快速开始
+## 已实现功能
+
+### 1. 多 Agent 编排
+
+- `Orchestrator` 支持接收任务、分解任务、优先级调度、结果汇总、失败重分配
+- `Worker` 支持任务执行、进度回传、心跳保活、帮助请求、子任务委派
+- `TaskManager` 与 `StateManager` 使用 SQLite 持久化任务树、依赖和 Agent 状态
+- `MemoryService` 支持读取 `AGENTS.md` / repo 文档 / 配置记忆并缓存
+
+### 2. 工作区执行
+
+- `WorkspaceExecutor` 支持 5 类动作：读文件、找文件、写文件、跑命令、结束任务
+- 支持目录扫描、Git 状态注入、进度事件回传
+- Shell 命令默认受白名单约束，不允许随意越权执行
+
+### 3. Harness 可靠性能力
+
+- `VerificationEngine` 统一执行 `lint`、`typecheck`、`test`、`build`、`custom checks`
+- 任务“完成”必须来自 verifier verdict，不接受模型自报完成
+- `TraceRecorder` 和 middleware hooks 会记录 prompt、tool、verify、失败、完成等事件
+- `FailureMemoryStore` 会把高价值失败模式写入 `docs/failure-catalog.md`
+- `PermissionProfile`、`VerificationPolicy`、`TraceEvent` 等通用结构已经沉淀到 `src/harness/`
+
+### 4. Telegram 控制面
+
+- 已支持 `/task`、`/project`、`/projects`、`/pwd`、`/queue`、`/logs`、`/cancel`、`/status`、`/workers`、`/reset`、`/help`
+- 支持项目目录切换、搜索工作区、任务状态查看、日志查看、软取消和长消息分段发送
+
+### 5. 未来项目复用
+
+- `templates/codex-harness/` 提供未来项目 starter
+- `scripts/init-codex-harness.mjs` 初始化 `AGENTS.md`、runbooks、failure catalog、benchmark
+- `scripts/check-doc-drift.mjs` 检查 Harness 文档是否漂移
+- `scripts/run-benchmarks.mjs` 汇总 benchmark 结果
+
+## 快速开始
+
+### 环境要求
+
+- Node.js 20+
+- npm
 
 ### 安装依赖
 
@@ -48,253 +72,132 @@ npm install
 
 ```bash
 cp .env.example .env
-# 编辑 .env 文件，填入你的 API Key
 ```
 
-### 编译项目
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+至少需要配置：
+
+- `AI_API_KEY`
+- `AI_BASE_URL`
+- `AI_MODEL`
+
+如果要启用 Telegram 控制面，还需要：
+
+- `TELEGRAM_BOT_TOKEN`
+- 可选：`TELEGRAM_CHAT_ID`
+- 可选：`WORKSPACE_ROOT`
+- 可选：`PROJECT_SEARCH_ROOTS`
+
+示例配置见：[.env.example](./.env.example)
+
+### 先跑一次完整验证
 
 ```bash
-npm run build
+npm run verify
 ```
 
-### 运行测试
+这会依次执行：
+
+- `npm run lint`
+- `npm run typecheck`
+- `npm test`
+- `npm run build`
+
+## 启动方式
+
+当前仓库还没有统一的 `npm start`，现在有两个正式入口。
+
+### 1. 本地基础运行
 
 ```bash
-npm test
+npm run example:basic
 ```
 
-## 📦 核心模块
+用途：
 
-### 1. Orchestrator（大哥）
+- 本地体验编排器工作流
+- 验证 `Orchestrator + Worker + Memory + Task/StateManager` 的基础协作
 
-负责任务分解、分配、监控和错误恢复。
-
-```typescript
-import { Orchestrator, ClaudeAPIClient, StateManager, TaskManager, MemoryService } from 'multi-agent-orchestrator';
-
-const orchestrator = new Orchestrator({
-  id: 'orchestrator-1',
-  apiClient: new ClaudeAPIClient({ apiKey: process.env.ANTHROPIC_API_KEY }),
-  stateManager,
-  taskManager,
-  memoryService,
-  workers: [],
-});
-
-// 接收任务
-const task = await orchestrator.receiveTask('开发一个用户登录功能');
-
-// 分解任务
-const subtasks = await orchestrator.decomposeTask(task);
-
-// 分配任务
-await orchestrator.assignTasks(subtasks);
-
-// 启动监控
-await orchestrator.start();
-```
-
-### 2. Worker（小弟）
-
-执行具体任务，支持子任务分配。
-
-```typescript
-import { Worker } from 'multi-agent-orchestrator';
-
-const worker = new Worker({
-  id: 'worker-1',
-  apiClient,
-  stateManager,
-  taskManager,
-  memoryService,
-});
-
-// 接收任务
-await worker.receiveTask(task);
-
-// 执行任务
-const result = await worker.executeTask(task);
-```
-
-### 3. Task Manager（任务管理器）
-
-管理任务队列、依赖关系和状态。
-
-```typescript
-import { TaskManager } from 'multi-agent-orchestrator';
-
-const taskManager = new TaskManager({
-  dbPath: './data/tasks.db',
-  maxDepth: 3,
-});
-
-// 添加任务
-await taskManager.addTask(task);
-
-// 获取下一个任务
-const nextTask = await taskManager.getNextTask();
-
-// 更新任务状态
-await taskManager.updateTaskStatus(task.id, 'completed', result);
-```
-
-### 4. State Manager（状态管理器）
-
-追踪所有 Agent 的状态和心跳。
-
-```typescript
-import { StateManager } from 'multi-agent-orchestrator';
-
-const stateManager = new StateManager({
-  dbPath: './data/state.db',
-  heartbeatTimeout: 10 * 60 * 1000, // 10 分钟
-});
-
-// 注册 Agent
-await stateManager.registerAgent(agent);
-
-// 更新状态
-await stateManager.updateStatus(agentId, 'busy', taskId);
-
-// 获取空闲 Worker
-const idleWorkers = await stateManager.getIdleWorkers();
-```
-
-### 5. Memory Service（记忆服务）
-
-中央化的配置和记忆管理。
-
-```typescript
-import { MemoryService } from 'multi-agent-orchestrator';
-
-const memoryService = new MemoryService({
-  configRoot: '~/.claude',
-  cacheSize: 100,
-  enableWatch: true,
-});
-
-// 读取记忆
-const config = await memoryService.read('CLAUDE.md');
-
-// 写入记忆
-await memoryService.write('custom-config.json', { key: 'value' });
-
-// 订阅变更
-memoryService.subscribe('CLAUDE.md', (data) => {
-  console.log('配置已更新:', data);
-});
-```
-
-## 🧪 测试
-
-项目包含完整的单元测试和集成测试：
+### 2. Telegram 服务模式
 
 ```bash
-# 运行所有测试
-npm test
-
-# 运行测试并生成覆盖率报告
-npm run test:coverage
-
-# 运行特定测试
-npm test -- state-manager.test.ts
+npm run example:telegram
 ```
 
-## 📚 文档
+用途：
 
-- [架构文档](./docs/architecture.md) - 详细的系统架构设计
-- [API 文档](./docs/api.md) - API 接口文档（待完成）
-- [部署文档](./docs/deployment.md) - 部署指南（待完成）
+- 作为长期运行的 Bot / 服务入口
+- 通过 Telegram 向编排器派发任务、查看状态、切换工作区
 
-## 🛠️ 开发
+启动后会持续运行，直到 `Ctrl+C` 停止。
 
-### 项目结构
-
-```
-src/
-├── types/              # 类型定义
-├── integrations/       # 外部集成
-│   └── claude/         # Claude API 集成
-├── core/               # 核心模块
-│   ├── memory-service.ts
-│   ├── state-manager.ts
-│   ├── task-manager.ts
-│   ├── worker.ts
-│   └── orchestrator.ts
-├── database/           # 数据库 Schema
-└── index.ts            # 入口文件
-```
-
-### 开发命令
+## 常用命令
 
 ```bash
-# 开发模式（监听文件变化）
-npm run dev
-
-# 编译
-npm run build
-
-# 代码检查
 npm run lint
-
-# 代码格式化
-npm run format
+npm run typecheck
+npm test
+npm run build
+npm run verify
+npm run harness:init
+npm run harness:doctor
+npm run benchmarks
+npm run example:basic
+npm run example:telegram
 ```
 
-## 🔧 技术栈
+## 目录结构
 
-- **运行时**: Node.js 20+
-- **语言**: TypeScript 5+
-- **AI API**: Claude API (Anthropic)
-- **数据库**: SQLite (better-sqlite3)
-- **测试**: Vitest
-- **代码质量**: ESLint + Prettier
+```text
+src/
+  core/                  运行时核心：Orchestrator、Worker、WorkspaceExecutor
+  harness/               verifier、trace、middleware、failure memory、permissions
+  integrations/
+    llm/                 通用 LLM 抽象
+    codex/               Codex/OpenAI-compatible 接入
+    claude/              Claude 接入
+    telegram/            Telegram Bot 控制面
+  database/              SQLite schema
+  types/                 类型定义
+  index.ts               统一导出入口
 
-## 📝 待完成功能
+docs/                    上手、agent map、failure catalog、运维与发布文档
+benchmarks/              benchmark 样例与结果
+templates/codex-harness/ 未来项目可复用 starter
+scripts/                 harness 初始化、自检、benchmark 工具
+tests/                   单元与集成测试
+```
 
-### P1 - Telegram 集成和可视化
+## 文档入口
 
-- [x] Telegram Bot 基础集成（框架已完成）
-- [ ] 结构化消息格式（已实现基础版本）
-- [ ] 实时进度展示（已实现基础版本）
-- [ ] Clawdbot Gateway 集成
-- [ ] 部署到 WSL2
+建议从这些文档开始：
 
-### P2 - 监控和优化
+- [AGENTS.md](./AGENTS.md)
+- [docs/README.md](./docs/README.md)
+- [docs/项目功能与上手清单.md](./docs/%E9%A1%B9%E7%9B%AE%E5%8A%9F%E8%83%BD%E4%B8%8E%E4%B8%8A%E6%89%8B%E6%B8%85%E5%8D%95.md)
+- [docs/agent-map.md](./docs/agent-map.md)
+- [docs/runbooks/verification.md](./docs/runbooks/verification.md)
+- [docs/failure-catalog.md](./docs/failure-catalog.md)
 
-- [ ] 监控和统计
-- [ ] 安全审查
-- [ ] 性能优化
-- [ ] 文档和示例（部分完成）
+## 适合什么场景
 
-## 🎉 最新更新
+- 想让多个 Agent 协作完成开发任务，而不是单 Agent 串行生成
+- 想把“写完就算完成”改成“必须通过验证才算完成”
+- 想让失败经验沉淀成可复用的 Harness 资产
+- 想为未来新项目提供统一的 Agent 模板、runbook、benchmark 与权限边界
 
-### v0.2.0 (2026-01-30)
+## 当前状态
 
-- ✅ 添加 Telegram Bot 集成框架
-- ✅ 创建基础使用示例
-- ✅ 创建 Telegram Bot 使用示例
-- ✅ 完善文档和配置
+- 版本：`0.2.0`
+- 状态：多 Agent 编排 + Codex Harness 基线已接通
+- 验证链路：`lint / typecheck / test / build`
+- 示例入口：`example:basic`、`example:telegram`
 
-## 🤝 贡献
+## License
 
-欢迎提交 Issue 和 Pull Request！
-
-## 📄 许可证
-
-MIT License
-
-## 👥 作者
-
-- Claude Code
-
-## 🙏 致谢
-
-- Anthropic Claude API
-- 所有开源贡献者
-
----
-
-**版本**: 0.2.0
-**状态**: P0 完成 + P1 框架完成
-**最后更新**: 2026-01-30
+MIT

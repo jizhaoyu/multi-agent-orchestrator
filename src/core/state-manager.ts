@@ -48,6 +48,12 @@ export class StateManager implements IStateManager {
         `
       INSERT INTO agents (id, type, status, current_task_id, last_heartbeat, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        type = excluded.type,
+        status = excluded.status,
+        current_task_id = excluded.current_task_id,
+        last_heartbeat = excluded.last_heartbeat,
+        updated_at = excluded.updated_at
     `
       )
       .run(
@@ -66,6 +72,11 @@ export class StateManager implements IStateManager {
         `
       INSERT INTO agent_stats (agent_id, tasks_completed, tasks_failed, total_tokens, avg_completion_time)
       VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET
+        tasks_completed = excluded.tasks_completed,
+        tasks_failed = excluded.tasks_failed,
+        total_tokens = excluded.total_tokens,
+        avg_completion_time = excluded.avg_completion_time
     `
       )
       .run(

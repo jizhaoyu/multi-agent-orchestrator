@@ -1,0 +1,11 @@
+{
+  "caseId": "sample-regression-trap",
+  "scores": {
+    "success_rate": 1,
+    "false_complete_rate": 1,
+    "attempt_efficiency": 0.75
+  },
+  "notes": [
+    "Sample result fixture for future benchmark runs."
+  ]
+}

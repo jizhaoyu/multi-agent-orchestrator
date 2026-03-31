@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   started_at INTEGER,
   completed_at INTEGER,
   FOREIGN KEY (parent_id) REFERENCES tasks(id) ON DELETE CASCADE,
-  FOREIGN KEY (assigned_to) REFERENCES agents(id) ON DELETE SET NULL
+  -- assigned_to 由 StateManager 在独立数据库中维护，不能在这里做跨库外键
+  CHECK (assigned_to IS NULL OR length(assigned_to) > 0)
 );
 
 -- 索引

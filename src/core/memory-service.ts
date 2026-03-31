@@ -4,7 +4,8 @@
  */
 
 import { EventEmitter } from 'events';
-import * as fs from 'fs/promises';
+import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
 import AsyncLock from 'async-lock';
 import { LRUCache } from 'lru-cache';
@@ -32,7 +33,7 @@ export interface MemoryServiceConfig {
  */
 export class MemoryService extends EventEmitter implements IMemoryService {
   private config: Required<MemoryServiceConfig>;
-  private cache: LRUCache<string, unknown>;
+  private cache: LRUCache<string, any>;
   private lock: AsyncLock;
   private watchers: Map<string, fs.FSWatcher>;
 
@@ -80,7 +81,7 @@ export class MemoryService extends EventEmitter implements IMemoryService {
       const fullPath = this.resolvePath(relativePath);
 
       try {
-        const content = await fs.readFile(fullPath, 'utf-8');
+        const content = await fsp.readFile(fullPath, 'utf-8');
 
         // 尝试解析 JSON
         let data: unknown;
@@ -117,7 +118,7 @@ export class MemoryService extends EventEmitter implements IMemoryService {
       const fullPath = this.resolvePath(relativePath);
 
       // 确保目录存在
-      await fs.mkdir(path.dirname(fullPath), { recursive: true });
+      await fsp.mkdir(path.dirname(fullPath), { recursive: true });
 
       // 序列化数据
       let content: string;
@@ -128,14 +129,39 @@ export class MemoryService extends EventEmitter implements IMemoryService {
       }
 
       // 写入文件
-      await fs.writeFile(fullPath, content, 'utf-8');
+      await fsp.writeFile(fullPath, content, 'utf-8');
 
       // 更新缓存
       this.cache.set(relativePath, data);
 
       // 触发变更事件
       this.emit('change', relativePath, data);
+      this.emit(`change:${relativePath}`, data);
     });
+  }
+
+  async readFirst(
+    relativePaths: string[]
+  ): Promise<{ path: string; data: unknown } | null> {
+    for (const relativePath of relativePaths) {
+      try {
+        const data = await this.read(relativePath);
+        return {
+          path: relativePath,
+          data,
+        };
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.startsWith('Memory file not found:')
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    return null;
   }
 
   /**

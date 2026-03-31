@@ -6,13 +6,17 @@
 import {
   Orchestrator,
   Worker,
-  ClaudeAPIClient,
   StateManager,
   TaskManager,
   MemoryService,
+  createAPIClientFromEnv,
 } from '../src';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as dotenv from 'dotenv';
+
+dotenv.config();
 
 async function main() {
   console.log('🚀 Multi-Agent Orchestrator 示例\n');
@@ -26,11 +30,8 @@ async function main() {
   // 2. 初始化核心服务
   console.log('📦 初始化核心服务...');
 
-  const apiClient = new ClaudeAPIClient({
-    apiKey: process.env.ANTHROPIC_API_KEY || 'your-api-key',
-    model: 'claude-opus-4-5',
-    maxTokens: 200000,
-  });
+  const apiClient = createAPIClientFromEnv();
+  console.log(`🤖 当前 AI Provider: ${process.env.AI_PROVIDER || 'codex'}`);
 
   const stateManager = new StateManager({
     dbPath: path.join(dataDir, 'state.db'),
@@ -43,7 +44,7 @@ async function main() {
   });
 
   const memoryService = new MemoryService({
-    configRoot: process.env.CONFIG_ROOT || path.join(process.env.HOME || '~', '.claude'),
+    configRoot: resolveConfigRoot(),
     cacheSize: 100,
     enableWatch: false, // 示例中禁用文件监听
   });
@@ -184,3 +185,7 @@ main().catch((error) => {
   console.error('❌ 错误:', error);
   process.exit(1);
 });
+
+function resolveConfigRoot(): string {
+  return process.env.CONFIG_ROOT || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}

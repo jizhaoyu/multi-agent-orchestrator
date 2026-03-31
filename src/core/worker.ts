@@ -11,10 +11,22 @@ import type {
   AgentStatus,
   AgentStats,
 } from '@/types';
-import { ClaudeAPIClient, ContextBuilder } from '@/integrations/claude';
+import { ContextBuilder } from '@/integrations/llm';
+import type { LLMClient, LLMMessage } from '@/integrations/llm';
 import { StateManager } from './state-manager';
 import { TaskManager } from './task-manager';
 import { MemoryService } from './memory-service';
+import type {
+  HarnessHooks,
+  PermissionProfile,
+  TraceRecorder,
+  VerificationPolicy,
+} from '@/harness';
+import {
+  WorkspaceExecutor,
+  type WorkspaceExecutionResult,
+  type WorkspaceExecutionProgressEvent,
+} from './workspace-executor';
 
 /**
  * Worker 配置
@@ -23,8 +35,8 @@ export interface WorkerConfig {
   /** Worker ID */
   id: string;
 
-  /** Claude API 客户端 */
-  apiClient: ClaudeAPIClient;
+  /** AI 客户端 */
+  apiClient: LLMClient;
 
   /** 状态管理器 */
   stateManager: StateManager;
@@ -40,6 +52,36 @@ export interface WorkerConfig {
 
   /** 系统 Prompt */
   systemPrompt?: string;
+
+  /** 指令文件搜索顺序 */
+  instructionFiles?: string[];
+
+  /** 最大上下文字符数 */
+  maxInstructionContextChars?: number;
+
+  /** 工作区根目录 */
+  workspaceRoot?: string;
+
+  /** 是否启用本地工作区执行 */
+  enableWorkspaceExecution?: boolean;
+
+  /** 本地执行最大轮数 */
+  maxExecutionIterations?: number;
+
+  /** 命令执行超时时间 */
+  commandTimeoutMs?: number;
+
+  /** 验证策略 */
+  verificationPolicy?: VerificationPolicy;
+
+  /** 命令权限档位 */
+  permissionProfile?: PermissionProfile;
+
+  /** Trace 记录器 */
+  traceRecorder?: TraceRecorder;
+
+  /** 生命周期 Hooks */
+  hooks?: HarnessHooks;
 }
 
 /**
@@ -55,10 +97,21 @@ export interface WorkerProgressEvent {
  * Worker（小弟）
  */
 export class Worker extends EventEmitter implements IWorker, IAgent {
-  private config: Required<Omit<WorkerConfig, 'apiClient' | 'stateManager' | 'taskManager' | 'memoryService'>> & WorkerConfig;
+  private config: WorkerConfig & {
+    heartbeatInterval: number;
+    systemPrompt: string;
+    instructionFiles: string[];
+    maxInstructionContextChars: number;
+    workspaceRoot: string;
+    enableWorkspaceExecution: boolean;
+    maxExecutionIterations: number;
+    commandTimeoutMs: number;
+    permissionProfile: PermissionProfile;
+  };
   private currentTask: ITask | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private readonly workspaceExecutors = new Map<string, WorkspaceExecutor>();
 
   // IAgent 接口实现
   id: string;
@@ -76,6 +129,25 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
       ...config,
       heartbeatInterval: config.heartbeatInterval || 5 * 60 * 1000, // 5 分钟
       systemPrompt: config.systemPrompt || getDefaultWorkerSystemPrompt(),
+      instructionFiles: config.instructionFiles || [
+        'AGENTS.md',
+        'codex-harness.config.json',
+        'docs/agent-map.md',
+        'docs/runbooks/verification.md',
+        'docs/failure-catalog.md',
+        'CODEX.md',
+        'CLAUDE.md',
+      ],
+      maxInstructionContextChars: config.maxInstructionContextChars || 12000,
+      workspaceRoot: config.workspaceRoot || '',
+      enableWorkspaceExecution:
+        config.enableWorkspaceExecution ?? Boolean(config.workspaceRoot),
+      maxExecutionIterations: config.maxExecutionIterations || 6,
+      commandTimeoutMs: config.commandTimeoutMs || 120000,
+      verificationPolicy: config.verificationPolicy,
+      permissionProfile: config.permissionProfile || 'dev_safe',
+      traceRecorder: config.traceRecorder,
+      hooks: config.hooks,
     };
 
     this.lastHeartbeat = new Date();
@@ -118,31 +190,29 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
     const startTime = Date.now();
 
     try {
-      // 构建上下文
-      const context = await this.buildContext(task);
+      const workspaceExecutor = this.getWorkspaceExecutor(task);
+      const execution =
+        workspaceExecutor
+          ? {
+              result: await workspaceExecutor.executeTask(task),
+              tokenUsage: 0,
+            }
+          : await this.executeTextTask(task);
+      const result = execution.result;
 
-      // 调用 Claude API
-      const response = await this.config.apiClient.sendMessage(context.messages, {
-        system: context.system,
-      });
+      task.result = result;
+      task.status = 'completed';
+      task.completedAt = new Date();
 
       // 更新统计
-      this.stats.totalTokens += response.tokensUsed.total;
+      this.stats.totalTokens += execution.tokenUsage || this.getResultTokenUsage(result);
       this.stats.tasksCompleted++;
-
-      // 报告完成
-      this.emit('task-completed', task);
-      this.emit('progress', {
-        taskId: task.id,
-        progress: 100,
-        message: '任务完成',
-      } as WorkerProgressEvent);
 
       // 更新任务状态
       await this.config.taskManager.updateTaskStatus(
         task.id,
         'completed',
-        response.content
+        result
       );
 
       // 更新状态
@@ -153,9 +223,19 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
 
       await this.config.stateManager.updateStats(this.id, this.stats);
 
-      return response.content;
+      // 报告完成
+      this.emit('task-completed', task);
+      this.emit('progress', {
+        taskId: task.id,
+        progress: 100,
+        message: '任务完成',
+      } as WorkerProgressEvent);
+
+      return result;
     } catch (error) {
       this.stats.tasksFailed++;
+      task.error = error instanceof Error ? error.message : String(error);
+      task.status = 'failed';
 
       await this.config.taskManager.updateTaskStatus(
         task.id,
@@ -240,6 +320,9 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
 
     // 选择一个 Worker（简单的轮询）
     const targetWorker = availableWorkers[0];
+    if (!targetWorker) {
+      return;
+    }
 
     // 分配任务
     await this.config.taskManager.assignTask(subtask.id, targetWorker.id);
@@ -292,7 +375,7 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
    * 构建上下文
    */
   private async buildContext(task: ITask): Promise<{
-    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+    messages: LLMMessage[];
     system?: string;
   }> {
     const builder = new ContextBuilder();
@@ -310,8 +393,10 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
 
     // 添加配置信息（从记忆服务读取）
     try {
-      const claudeConfig = await this.config.memoryService.read('CLAUDE.md') as string;
-      message += `\n--- 配置信息 ---\n${claudeConfig}\n---\n`;
+      const instructionContext = await this.readInstructionContext();
+      if (instructionContext) {
+        message += `\n${instructionContext}\n`;
+      }
     } catch {
       // 配置文件不存在，忽略
     }
@@ -330,17 +415,119 @@ export class Worker extends EventEmitter implements IWorker, IAgent {
     this.stopHeartbeat();
     this.removeAllListeners();
   }
+
+  private async executeTextTask(task: ITask): Promise<{
+    result: string;
+    tokenUsage: number;
+  }> {
+    // 构建上下文
+    const context = await this.buildContext(task);
+
+    // 调用 AI API
+    const response = await this.config.apiClient.sendMessage(context.messages, {
+      system: context.system,
+    });
+
+    return {
+      result: response.content,
+      tokenUsage: response.tokensUsed.total,
+    };
+  }
+
+  private getResultTokenUsage(result: string | WorkspaceExecutionResult): number {
+    if (typeof result === 'string') {
+      return 0;
+    }
+
+    return result.tokenUsage.total;
+  }
+
+  private getWorkspaceExecutor(task: ITask): WorkspaceExecutor | null {
+    if (!this.config.enableWorkspaceExecution) {
+      return null;
+    }
+
+    const workspaceRoot = this.resolveWorkspaceRoot(task);
+    if (!workspaceRoot) {
+      return null;
+    }
+
+    const cachedExecutor = this.workspaceExecutors.get(workspaceRoot);
+    if (cachedExecutor) {
+      return cachedExecutor;
+    }
+
+    const executor = new WorkspaceExecutor({
+      workspaceRoot,
+      apiClient: this.config.apiClient,
+      maxIterations: this.config.maxExecutionIterations,
+      commandTimeoutMs: this.config.commandTimeoutMs,
+      verificationPolicy: this.config.verificationPolicy,
+      permissionProfile: this.config.permissionProfile,
+      traceRecorder: this.config.traceRecorder,
+      hooks: this.config.hooks,
+      onProgress: async (event: WorkspaceExecutionProgressEvent) => {
+        await this.reportProgress(event.progress, event.message);
+      },
+    });
+    this.workspaceExecutors.set(workspaceRoot, executor);
+    return executor;
+  }
+
+  private resolveWorkspaceRoot(task: ITask): string | null {
+    const contextWorkspaceRoot = task.context.workspaceRoot;
+    if (typeof contextWorkspaceRoot === 'string' && contextWorkspaceRoot.trim().length > 0) {
+      return contextWorkspaceRoot.trim();
+    }
+
+    return this.config.workspaceRoot || null;
+  }
+
+  private async readInstructionContext(): Promise<string | null> {
+    const sections: string[] = [];
+    let totalChars = 0;
+
+    for (const relativePath of this.config.instructionFiles) {
+      try {
+        const data = await this.config.memoryService.read(relativePath);
+        const content =
+          typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+        const remaining = this.config.maxInstructionContextChars - totalChars;
+        if (remaining <= 0) {
+          break;
+        }
+
+        const clipped = content.length > remaining ? `${content.slice(0, remaining)}\n...[truncated]` : content;
+        sections.push(`--- ${relativePath} ---\n${clipped}\n---`);
+        totalChars += clipped.length;
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.startsWith('Memory file not found:')
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    if (sections.length === 0) {
+      return null;
+    }
+
+    return sections.join('\n\n');
+  }
 }
 
 /**
  * 获取默认 Worker 系统提示词
  */
 function getDefaultWorkerSystemPrompt(): string {
-  return `你是一个 AI 团队的成员（小弟），拥有和大哥同等的能力和权限。
+  return `你是一个 Codex 风格 AI 团队的成员（小弟），拥有和大哥同等的能力和权限。
 
 ## 你的能力
 
-- 所有 Claude Code 的工具、Skills、Agents、MCP
+- 所有 Codex 的工具、Skills、Agents、MCP
 - 可以指挥其他空闲的小弟帮你完成子任务
 - 可以自主决定任务的执行粒度
 - 遇到问题可以 @大哥 或 @老大 求助
