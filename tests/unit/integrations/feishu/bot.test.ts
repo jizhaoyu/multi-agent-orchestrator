@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { createHmac } from 'crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ITask } from '@/types';
 import { FeishuBotIntegration } from '@/integrations/feishu';
@@ -33,6 +34,21 @@ describe('FeishuBotIntegration', () => {
       }
 
       if (url.includes('/im/v1/messages')) {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            msg: 'ok',
+          }),
+          {
+            status: 200,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          }
+        );
+      }
+
+      if (url === 'https://example.com/feishu-webhook') {
         return new Response(
           JSON.stringify({
             code: 0,
@@ -127,6 +143,37 @@ describe('FeishuBotIntegration', () => {
     );
     expect(extractSentTexts(fetchMock)).toEqual(
       expect.arrayContaining([expect.stringContaining('已收到中断请求: task-running')])
+    );
+  });
+
+  it('should sign webhook payloads when webhook secret is configured', async () => {
+    await integration.destroy();
+    integration = new FeishuBotIntegration({
+      webhookUrl: 'https://example.com/feishu-webhook',
+      webhookSecret: 'webhook-secret',
+      orchestrator: orchestrator as unknown as any,
+      workers: workers as unknown as any,
+    });
+
+    await integration.sendNotification('测试推送');
+
+    const webhookCall = fetchMock.mock.calls.find(
+      ([input]) => String(input) === 'https://example.com/feishu-webhook'
+    );
+    expect(webhookCall).toBeTruthy();
+
+    const payload = JSON.parse(String((webhookCall?.[1] as RequestInit).body)) as {
+      msg_type: string;
+      content: { text: string };
+      timestamp?: string;
+      sign?: string;
+    };
+
+    expect(payload.msg_type).toBe('text');
+    expect(payload.content.text).toBe('测试推送');
+    expect(payload.timestamp).toMatch(/^\d+$/);
+    expect(payload.sign).toBe(
+      createHmac('sha256', `${payload.timestamp}\nwebhook-secret`).digest('base64')
     );
   });
 });

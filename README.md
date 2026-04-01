@@ -140,6 +140,7 @@ Copy-Item .env.example .env
 如果要启用 Feishu 控制面，还需要：
 
 - `FEISHU_WEBHOOK_URL`，用于把消息推送到飞书自定义机器人
+- 可选：`FEISHU_WEBHOOK_SECRET`，如果飞书群机器人开启了签名校验则必须配置
 - 如果要从飞书直接发消息控制任务，还需要 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`
 - 可选：`FEISHU_VERIFICATION_TOKEN`
 - 可选：`FEISHU_EVENT_HOST`
@@ -210,7 +211,49 @@ npm run start:feishu
 - 通过飞书事件订阅 URL 接收文本消息
 - 在飞书群或会话里发起任务、取消任务、查询当前状态
 - 如果只配置 `FEISHU_WEBHOOK_URL`，可先用于结果推送；若要从飞书里直接下发任务，需要继续配置事件订阅能力
+- 如果你采用“Telegram 发任务，Feishu 群接收总结”的模式，只需要运行 `npm run start:telegram` 并额外配置 `FEISHU_WEBHOOK_URL`
 - 与 Telegram 配置共存，按需独立启停
+
+## Telegram 下发 + Feishu 汇总
+
+如果你的使用方式是：
+
+- 在 Telegram 里给 Bot 发任务
+- 仍由本地 `Orchestrator` 和 `Worker` 执行
+- 只把最终总结和重大异常推送到飞书群
+
+那么只需要：
+
+1. 配置 `TELEGRAM_BOT_TOKEN`
+2. 配置 `FEISHU_WEBHOOK_URL`
+3. 如果飞书群机器人开启了签名校验，再额外配置 `FEISHU_WEBHOOK_SECRET`
+4. 启动 `npm run start:telegram`
+
+这种模式下不需要：
+
+- `npm run start:feishu`
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- 飞书事件订阅回调地址
+
+参考配置：
+
+```env
+AI_PROVIDER=codex
+AI_API_KEY=your-api-key
+AI_BASE_URL=https://your-provider.example/v1
+AI_MODEL=your-model
+
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_CHAT_ID=
+
+FEISHU_WEBHOOK_URL=your-feishu-webhook-url
+FEISHU_WEBHOOK_SECRET=
+
+WORKSPACE_ROOT=/path/to/your/workspace
+PROJECT_SEARCH_ROOTS=/path/to/projects
+ENABLE_WORKSPACE_EXECUTION=true
+```
 
 ## 常用命令
 

@@ -108,6 +108,7 @@ async function main() {
         appId: process.env.FEISHU_APP_ID,
         appSecret: process.env.FEISHU_APP_SECRET,
         webhookUrl: process.env.FEISHU_WEBHOOK_URL,
+        webhookSecret: process.env.FEISHU_WEBHOOK_SECRET,
         defaultChatId: process.env.FEISHU_CHAT_ID,
         orchestrator,
         workers,
@@ -132,7 +133,7 @@ async function main() {
   if (feishuNotifier) {
     telegramBot.on('final-summary', async (event) => {
       try {
-        await feishuNotifier.sendNotification(event.content);
+        await feishuNotifier.sendNotification(formatFeishuNotification(event));
       } catch (error) {
         console.error('Feishu summary push failed:', error);
       }
@@ -141,7 +142,15 @@ async function main() {
     telegramBot.on('execution-error', async (event) => {
       try {
         await feishuNotifier.sendNotification(
-          ['⚠️ 任务异常', '', `聊天: ${event.chatId}`, `任务: ${event.taskId}`, event.error].join('\n')
+          [
+            '⚠️ Telegram 任务异常',
+            '',
+            `来源会话: ${event.chatId}`,
+            `任务 ID: ${event.taskId}`,
+            `推送时间: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+            '',
+            event.error,
+          ].join('\n')
         );
       } catch (error) {
         console.error('Feishu error push failed:', error);
@@ -230,4 +239,51 @@ function shouldEnableFeishuPush(): boolean {
       process.env.FEISHU_APP_SECRET &&
       process.env.FEISHU_CHAT_ID
   );
+}
+
+function formatFeishuNotification(event: {
+  chatId: string;
+  summary: unknown;
+  content: string;
+}): string {
+  const lines = [
+    '📣 Telegram 任务汇报',
+    '',
+    `来源会话: ${event.chatId}`,
+    `执行状态: ${describeExecutionStatus(event.summary)}`,
+    `推送时间: ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+    '',
+    event.content,
+  ];
+
+  return lines.join('\n');
+}
+
+function describeExecutionStatus(summary: unknown): string {
+  if (typeof summary !== 'object' || summary === null) {
+    return '已完成';
+  }
+
+  const summaryRecord = summary as {
+    completedTasks?: unknown;
+    failedTasks?: unknown;
+  };
+  const completedTasks =
+    typeof summaryRecord.completedTasks === 'number' ? summaryRecord.completedTasks : undefined;
+  const failedTasks =
+    typeof summaryRecord.failedTasks === 'number' ? summaryRecord.failedTasks : undefined;
+
+  if ((failedTasks || 0) > 0 && (completedTasks || 0) > 0) {
+    return `部分完成（成功 ${completedTasks} / 失败 ${failedTasks}）`;
+  }
+
+  if ((failedTasks || 0) > 0) {
+    return `执行失败（失败 ${failedTasks}）`;
+  }
+
+  if ((completedTasks || 0) > 0) {
+    return `执行完成（成功 ${completedTasks}）`;
+  }
+
+  return '已完成';
 }

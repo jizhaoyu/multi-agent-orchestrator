@@ -82,6 +82,7 @@ async function main() {
     appId: process.env.FEISHU_APP_ID,
     appSecret: process.env.FEISHU_APP_SECRET,
     webhookUrl: process.env.FEISHU_WEBHOOK_URL,
+    webhookSecret: process.env.FEISHU_WEBHOOK_SECRET,
     verificationToken: process.env.FEISHU_VERIFICATION_TOKEN,
     defaultChatId: process.env.FEISHU_CHAT_ID,
     defaultWorkspaceRoot: workspaceRoot,

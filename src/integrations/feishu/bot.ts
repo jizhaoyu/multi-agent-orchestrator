@@ -5,6 +5,7 @@
 
 import { EventEmitter } from 'events';
 import * as http from 'http';
+import { createHmac } from 'crypto';
 import type {
   IntegratedTaskFailureSummary,
   IntegratedTaskResultSummary,
@@ -20,6 +21,7 @@ export interface FeishuBotConfig {
   appId?: string;
   appSecret?: string;
   webhookUrl?: string;
+  webhookSecret?: string;
   orchestrator: Orchestrator;
   workers: Worker[];
   host?: string;
@@ -57,6 +59,7 @@ interface InternalFeishuBotConfig {
   appId?: string;
   appSecret?: string;
   webhookUrl?: string;
+  webhookSecret?: string;
   orchestrator: Orchestrator;
   workers: Worker[];
   host: string;
@@ -538,27 +541,38 @@ export class FeishuBotIntegration extends EventEmitter {
 
   private async sendFeishuMessage(receiveId: string, text: string): Promise<void> {
     if (this.config.webhookUrl) {
+      const webhookRequestBody: {
+        msg_type: 'text';
+        content: { text: string };
+        timestamp?: string;
+        sign?: string;
+      } = {
+        msg_type: 'text',
+        content: {
+          text,
+        },
+      };
+
+      if (this.config.webhookSecret) {
+        Object.assign(webhookRequestBody, buildWebhookSecurityFields(this.config.webhookSecret));
+      }
+
       const webhookResponse = await fetch(this.config.webhookUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
         },
-        body: JSON.stringify({
-          msg_type: 'text',
-          content: {
-            text,
-          },
-        }),
+        body: JSON.stringify(webhookRequestBody),
       });
 
-      const webhookPayload = (await webhookResponse.json()) as {
+      const webhookResponseBody = (await webhookResponse.json()) as {
         code?: number;
         msg?: string;
       };
 
-      if (!webhookResponse.ok || webhookPayload.code) {
+      if (!webhookResponse.ok || webhookResponseBody.code) {
         throw new Error(
-          `Feishu webhook send failed: ${webhookPayload.msg || webhookResponse.statusText}`
+          `Feishu webhook send failed: ${webhookResponseBody.msg || webhookResponse.statusText}`
         );
       }
       return;
@@ -916,4 +930,18 @@ function summarizeResult(item: IntegratedTaskResultSummary): string {
   }
 
   return item.description;
+}
+
+function buildWebhookSecurityFields(secret: string): {
+  timestamp: string;
+  sign: string;
+} {
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const stringToSign = `${timestamp}\n${secret}`;
+
+  // Feishu custom bot signs with "timestamp\nsecret" as the HMAC key.
+  return {
+    timestamp,
+    sign: createHmac('sha256', stringToSign).digest('base64'),
+  };
 }
